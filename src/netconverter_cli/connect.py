@@ -372,11 +372,12 @@ REMOTE_STEPS = {
         "                   client ID your administrator gives you, then sign in with your\n"
         "                   NetConverter account when asked.\n"
         "Then enable NetConverter in a chat from the + menu (Developer mode).\n"
-        "To upload configuration files from ChatGPT: the ChatGPT desktop app's agent (Codex) runs\n"
-        "this bridge from ~/.codex/config.toml. In your migrations folder run\n"
+        "For local files, use a local MCP connection (Codex or a compatible ChatGPT desktop\n"
+        "execution mode), distinct from this hosted connector. In your migrations folder run\n"
         "`netconverter connect codex` and, for the guided-migration tools,\n"
-        "`netconverter privacy level full`; then restart ChatGPT. ChatGPT cannot show the\n"
-        "upload form, so it asks you in the chat before each upload (docs/connect/chatgpt.md)."),
+        "`netconverter privacy level full`; then reconnect that client's MCP session. Verify\n"
+        "submit_file is listed. Running Terminal alone does not pair a folder to the hosted\n"
+        "connector. See docs/connect/chatgpt.md for the local/hosted distinction and approval flow."),
     "claude-ai": (
         "claude.ai (web and mobile)",
         "On claude.ai: Settings → Connectors → Add custom connector.\n"
@@ -392,9 +393,10 @@ def plan_remote(key: str) -> Change:
     title, steps = REMOTE_STEPS[key]
     url = remote_url()
     return Change(key, title, title,
-                  f"{title} can only use remote MCP servers, so it connects to NetConverter's hosted "
-                  "MCP rather than this folder's bridge. You get your jobs, results, account and "
-                  "knowledge base; to submit a configuration, use a local client "
+                  f"This {title} connection uses NetConverter's hosted MCP rather than this folder's "
+                  "bridge. You get server-side jobs, results, account and knowledge tools; available "
+                  "guided operations depend on the server and your account. It does not expose this "
+                  "computer's files. To submit a local configuration, use a local client "
                   "(Claude Desktop, Claude Code, Cursor, Gemini CLI …) with this bridge. "
                   "Your NetConverter administrator must have MCP access enabled for your account.",
                   steps.format(url=url), can_apply=False,

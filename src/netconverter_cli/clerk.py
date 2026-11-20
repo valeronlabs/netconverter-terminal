@@ -19,13 +19,13 @@ import secrets
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 
-from .credentials import CredentialStoreError, KeyringLocked, delete_secret, load_secret, prepare_store, save_secret
+from .credentials import CredentialStoreError, KeyringLocked, prepare_store, token_transaction
 from .errors import SIGNED_OUT
 
 ISSUER = "https://clerk.netconverter.ai"
@@ -138,6 +138,8 @@ class TokenSet:
     expires_at: float = 0.0
     scope: str = ""
     token_type: str = "Bearer"
+    _store_id: str = field(default="", repr=False, compare=False)
+    _generation: str = field(default="", repr=False, compare=False)
 
     @classmethod
     def from_response(cls, body, now: float, previous_refresh: str = "") -> "TokenSet":
@@ -432,41 +434,114 @@ def device_login(
 
 
 class TokenStore:
-    """Clerk tokens in the OS credential store; separate entries keep each small."""
+    """Atomic issuer/client/store-scoped credentials; separate entries stay small."""
 
     def __init__(self, issuer: str = ISSUER, client_id: str = CLIENT_ID):
         digest = hashlib.sha256(f"{issuer.rstrip('/')}|{client_id}".encode()).hexdigest()
         self.account = "clerk:" + digest[:24]
 
-    def save(self, tokens: TokenSet) -> bool:
-        meta = json.dumps(
-            {"expires_at": tokens.expires_at, "scope": tokens.scope, "token_type": "Bearer"}
-        )
-        ok = save_secret(self.account + ":refresh", tokens.refresh_token or "")
-        ok = ok and save_secret(self.account + ":access", tokens.access_token)
-        ok = ok and save_secret(self.account + ":meta", meta)
-        if not ok:
-            self.clear()
-        return ok
+    @staticmethod
+    def identity(tokens):
+        if tokens is None:
+            return None
+        return (tokens.access_token, tokens.refresh_token, tokens.expires_at, tokens.scope,
+                tokens.token_type, tokens._store_id, tokens._generation)
+
+    @staticmethod
+    def fingerprint(tokens):
+        return hashlib.sha256(json.dumps([tokens.access_token, tokens.refresh_token]).encode()).hexdigest()
+
+    def _scope(self, store):
+        return hashlib.sha256(json.dumps([store, self.account]).encode()).hexdigest()
+
+    def _read(self, stores):
+        for scope, store in stores:
+            access = store.get(self.account + ":access")
+            if not access:
+                continue
+            meta = json.loads(store.get(self.account + ":meta") or "{}")
+            if not isinstance(meta, dict) or meta.get("state") not in (None, "complete"):
+                raise CredentialStoreError("The saved sign-in is incomplete; sign in again")
+            value = TokenSet(access, store.get(self.account + ":refresh") or "",
+                             float(meta.get("expires_at", 0) or 0), str(meta.get("scope", "")),
+                             _store_id=self._scope(scope), _generation=meta.get("generation", ""))
+            if meta.get("state") == "complete" and (
+                    not isinstance(value._generation, str) or not re.fullmatch(r"[0-9a-f]{32}", value._generation)
+                    or meta.get("fingerprint") != self.fingerprint(value)):
+                raise CredentialStoreError("The saved sign-in is incomplete; sign in again")
+            return value
+        return None
+
+    def _write(self, store, tokens):
+        names = [self.account + suffix for suffix in (":access", ":refresh", ":meta")]
+        previous = [store.get(name) for name in names]
+        meta = {"expires_at": tokens.expires_at, "scope": tokens.scope, "token_type": "Bearer",
+                "state": "complete", "generation": secrets.token_hex(16), "fingerprint": self.fingerprint(tokens)}
+        try:
+            # Crash/partial-write detection: readers never accept a mixed pair.
+            store.set(names[2], json.dumps({"state": "updating"}))
+            store.set(names[1], tokens.refresh_token or "")
+            store.set(names[0], tokens.access_token)
+            store.set(names[2], json.dumps(meta))
+            return True
+        except Exception:
+            try:
+                for name, old in zip(names, previous):
+                    store.delete(name) if old is None else store.set(name, old)
+            except Exception:
+                raise CredentialStoreError("The credential update could not complete; unlock the store and sign in again") from None
+            return False
+
+    def _delete(self, store):
+        try:
+            store.set(self.account + ":meta", json.dumps({"state": "updating"}))
+            for suffix in (":access", ":refresh", ":meta"):
+                store.delete(self.account + suffix)
+            return True
+        except Exception:
+            return False
 
     def load(self) -> TokenSet | None:
-        access = load_secret(self.account + ":access")
-        if not access:
-            return None
-        try:
-            meta = json.loads(load_secret(self.account + ":meta") or "{}")
-        except ValueError:
-            meta = {}
-        return TokenSet(
-            access_token=access,
-            refresh_token=load_secret(self.account + ":refresh"),
-            expires_at=float(meta.get("expires_at", 0) or 0),
-            scope=str(meta.get("scope", "")),
-        )
+        return token_transaction(self.account, lambda stores, writer: self._read(stores))
+
+    def load_for(self, store_scope: str) -> TokenSet | None:
+        return token_transaction(self.account, lambda stores, writer: self._read(
+            [(scope, store) for scope, store in stores if self._scope(scope) == store_scope]))
+
+    def save(self, tokens: TokenSet) -> bool:
+        # Login writes participate in the same transaction as refresh/logout.
+        return token_transaction(self.account, lambda stores, writer: self._write(writer[1], tokens) if writer else False,
+                                 writing=True)
 
     def clear(self) -> bool:
-        results = [delete_secret(self.account + suffix) for suffix in (":access", ":refresh", ":meta")]
-        return all(results)
+        def clear(stores, writer):
+            return all([self._delete(store) for _, store in stores]) if stores else False
+        return token_transaction(self.account, clear)
+
+    def compare_save(self, expected: TokenSet, replacement: TokenSet):
+        def update(stores, writer):
+            stores = [(scope, store) for scope, store in stores if self._scope(scope) == expected._store_id]
+            current = self._read(stores)
+            if self.identity(current) != self.identity(expected):
+                return False, current
+            target = next(store for scope, store in stores if self._scope(scope) == current._store_id)
+            if not self._write(target, replacement):
+                raise CredentialStoreError("Could not save the refreshed sign-in")
+            return True, self._read(stores)
+        return token_transaction(self.account, update)
+
+    def compare_delete(self, expected: TokenSet | None):
+        def remove(stores, writer):
+            if expected is not None:
+                stores = [(scope, store) for scope, store in stores if self._scope(scope) == expected._store_id]
+            current = self._read(stores)
+            if self.identity(current) != self.identity(expected):
+                return False, current
+            if current is None:
+                return True, None
+            target = next(store for scope, store in stores if self._scope(scope) == current._store_id)
+            return self._delete(target), self._read(stores)
+        return token_transaction(self.account, remove)
 
 
 class ClerkSession:
@@ -480,7 +555,11 @@ class ClerkSession:
         self.issuer = issuer
         self._transport = transport
         self._clock = clock
-        self._tokens = self.store.load()
+        try:
+            self._tokens = self.store.load()
+        except CredentialStoreError:
+            raise ClerkError("Could not read your NetConverter sign-in; unlock the credential store or sign in again") from None
+        self._store_scope = self._tokens._store_id if self._tokens is not None else ""
         self._invalidated_fingerprint: str | None = None
         self._session_generation = 0
         self._discovery: Discovery | None = None
@@ -502,18 +581,35 @@ class ClerkSession:
         return hashlib.sha256(value.encode()).hexdigest()
 
     def _reload_locked(self) -> bool:
-        """Recover a later login from this session's existing issuer-bound store."""
-        if self._tokens is not None:
-            return False
+        """Observe replacement logins even while this instance still has a token."""
         try:
-            saved = self.store.load()
+            saved = (self.store.load_for(self._store_scope)
+                     if self._store_scope and hasattr(self.store, "load_for") else self.store.load())
         except (CredentialStoreError, KeyringLocked):
             raise ClerkError("Could not read your NetConverter sign-in; unlock the credential store and retry") from None
-        if saved is None or self._fingerprint(saved) == self._invalidated_fingerprint:
+        return self._adopt_locked(saved)
+
+    def _adopt_locked(self, saved) -> bool:
+        if saved is not None and self._store_scope and saved._store_id != self._store_scope:
+            saved = None  # an unrelated fallback store is not a replacement login
+        if saved is not None and self._fingerprint(saved) == self._invalidated_fingerprint:
+            saved = None
+        if TokenStore.identity(saved) == TokenStore.identity(self._tokens):
             return False
         self._tokens = saved
+        if saved is not None and not self._store_scope:
+            self._store_scope = saved._store_id
         self._session_generation += 1
         return True
+
+    def _compare(self, method, expected, *args):
+        action = getattr(self.store, method, None)
+        if action is None:
+            raise ClerkError("Credential store does not support atomic sign-in updates")
+        try:
+            return action(expected, *args)
+        except (CredentialStoreError, KeyringLocked):
+            raise ClerkError("Could not update your NetConverter sign-in; unlock the credential store and retry") from None
 
     def session_generation(self) -> int:
         """Reload a later login and identify caches belonging to an older login."""
@@ -534,7 +630,7 @@ class ClerkSession:
         with self._lock:
             # A new login already replaced the refused token; don't immediately
             # exchange its refresh token in response to the old request's 401.
-            if self._reload_locked() and not self._tokens.expired(self._clock()):
+            if self._reload_locked() and self._tokens is not None and not self._tokens.expired(self._clock()):
                 return True
             if self._tokens is None or not self._tokens.refresh_token:
                 return False
@@ -545,25 +641,27 @@ class ClerkSession:
                 return False
 
     def _refresh_locked(self) -> None:
+        previous = self._tokens
         with _http(self._transport) as http:
             try:
-                tokens = refresh_tokens(http, self._disc(http), self._tokens.refresh_token)
+                tokens = refresh_tokens(http, self._disc(http), previous.refresh_token)
             except OAuthError as exc:
                 if exc.error in {"invalid_grant", "invalid_token", "unauthorized_client"}:
-                    self._invalidated_fingerprint = self._fingerprint(self._tokens)
+                    self._invalidated_fingerprint = self._fingerprint(previous)
                     self._tokens = None
                     self._session_generation += 1
-                    # A separate login may have finished while refresh was in
-                    # flight. Its replacement must not be cleared by this failure.
-                    saved = self.store.load()
-                    if saved is not None and self._fingerprint(saved) == self._invalidated_fingerprint:
-                        self.store.clear()
+                    _, saved = self._compare("compare_delete", previous)
+                    self._adopt_locked(saved)
+                    if self._tokens is not None:
+                        return  # a newer login owns the store; never erase it
                     raise ClerkError(
                         "Your NetConverter sign-in expired; run `netconverter login --clerk`"
                     ) from None
                 raise
-        self._tokens = tokens
-        self.store.save(tokens)
+        _, saved = self._compare("compare_save", previous, tokens)
+        self._adopt_locked(saved)
+        if self._tokens is None:
+            raise ClerkError(SIGNED_OUT)
 
     def userinfo(self) -> dict:
         with _http(self._transport) as http:
@@ -604,10 +702,12 @@ class ClerkSession:
                                         "token": value, "token_type_hint": hint, "client_id": CLIENT_ID})
                 except (httpx.HTTPError, ClerkError):
                     pass  # local removal below is what logout guarantees
-            saved = self.store.load()
-            if tokens and saved and self._fingerprint(saved) != self._fingerprint(tokens):
-                return True  # a later login is not the session being revoked
-            return self.store.clear()
+            try:
+                removed, saved = self._compare("compare_delete", tokens)
+            except ClerkError:
+                return False
+            self._adopt_locked(saved)
+            return removed or saved is not None and self._fingerprint(saved) != self._invalidated_fingerprint
 
 
 UNNAMED_ORG = "(unnamed organization)"
@@ -675,6 +775,10 @@ def login(
             if device
             else browser_login(http, disc, open_browser=open_browser, notify=notify)
         )
-    if not store.save(tokens):
+    try:
+        saved = store.save(tokens)
+    except CredentialStoreError:
+        raise ClerkError("Could not save your NetConverter sign-in; unlock the credential store and sign in again") from None
+    if not saved:
         raise ClerkError(f"Could not save the sign-in to the {where or 'credential store'}")
     return tokens

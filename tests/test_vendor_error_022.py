@@ -71,21 +71,27 @@ def test_validate_vendor_auto_is_refused_before_any_upload(tmp_path, monkeypatch
 
 
 def test_validate_with_a_server_refused_vendor_prints_the_reason(tmp_path, monkeypatch, capsys):
-    """A code the local catalogue cannot judge still shows the server's message."""
+    """A known identity refused by an older server still shows its message."""
     (tmp_path / "srx.conf").write_text("system { host-name synthetic; }\n")
+    reason = "juniper_junos_router validation is unavailable on this server"
 
     class NoVendorList(VendorServer):
         def __call__(self, request):
             if request.url.path.endswith("/capabilities"):
                 self.requests.append(request)
                 return httpx.Response(200, json={"success": True, "data": {"job_types": ["validate"]}})
+            if request.url.path.endswith("/jobs") and request.method == "POST":
+                self.requests.append(request)
+                return httpx.Response(422, json={"success": False,
+                    "error": {"code": "unprocessable", "message": reason}})
             return super().__call__(request)
 
     client = ExternalClient(StaticCredential("nck_synthetic"), SERVER, transport=httpx.MockTransport(NoVendorList()))
     monkeypatch.setattr(cli, "open_client", lambda credential, url: (client, "external"))
     monkeypatch.setattr(cli, "get_secret", lambda *a, **k: "nck_synthetic")
     with pytest.raises(SystemExit):
-        cli.main(["--workspace", str(tmp_path), "--server", SERVER, "validate", "srx.conf", "--vendor", "auto"])
+        cli.main(["--workspace", str(tmp_path), "--server", SERVER, "validate", "srx.conf",
+                  "--vendor", "juniper_junos_router"])
     out = capsys.readouterr().err  # errors go to stderr (#9)
-    assert REASON in out
+    assert reason in out
     assert json.loads(out.splitlines()[-1]) if out.splitlines()[-1].startswith("{") else True

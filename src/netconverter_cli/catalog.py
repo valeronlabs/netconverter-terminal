@@ -16,6 +16,20 @@ QUICK_SOURCES = ("cisco_asa", "palo_alto_set", "palo_alto_xml", "palo_alto_panor
 QUICK_LIMIT_BYTES = 50_000
 DEVICE_TYPES = ("firewall", "router", "switch")
 
+# Identity contract, not a promise that a server supports every directed path.
+# Keep explicit device/format codes; bare Cisco/Juniper names are ambiguous.
+VENDOR_IDENTITIES = {
+    **dict.fromkeys(("cisco_asa", "palo_alto_xml", "palo_alto_set", "palo_alto_panorama",
+                     "fortinet", "cisco_fmc", "check_point"), "firewall"),
+    **dict.fromkeys(("cisco_ios_xe_router", "juniper_junos_router", "juniper_set_router"), "router"),
+    **dict.fromkeys(("cisco_ios_xe_switch", "juniper_junos_switch", "juniper_set_switch",
+                     "aruba_cx_switch", "aruba_os_switch"), "switch"),
+}
+# Public submit-door aliases whose canonical code is an accepted identity.
+# SCM, bare ArubaOS, Cisco and Juniper aliases do not open new submit paths.
+VENDOR_ALIASES = {"aruba_cx": "aruba_cx_switch", "fortinet_fortigate": "fortinet",
+                  "checkpoint": "check_point", "check-point": "check_point"}
+
 # Names for codes a server response may not name (quick capabilities carry codes only).
 NAMES = {
     "cisco_asa": "Cisco ASA",
@@ -57,10 +71,39 @@ FIELD_LABELS = {
 
 
 def device_type_of(code: str) -> str:
-    for kind in ("router", "switch"):
-        if code.endswith("_" + kind):
-            return kind
-    return "firewall"
+    return VENDOR_IDENTITIES[normalize_vendor(code)]
+
+
+def normalize_vendor(code: str) -> str:
+    if not isinstance(code, str):
+        raise ValueError("Use a supported vendor code with explicit router or switch identity")
+    canonical = VENDOR_ALIASES.get(code, code)
+    if canonical not in VENDOR_IDENTITIES:
+        raise ValueError("Use a supported vendor code with explicit router or switch identity")
+    return canonical
+
+
+def submission_vendors(source: str, target: str | None) -> tuple[str, str | None]:
+    source = normalize_vendor(source)
+    target = normalize_vendor(target) if target is not None else None
+    if target and device_type_of(source) != device_type_of(target):
+        raise ValueError("Source and target must have the same device type")
+    return source, target
+
+
+def legacy_submission_vendors(source: str, target: str | None) -> tuple[tuple[str, str | None], ...]:
+    """Equivalent v1 wire spellings only; preserve the old request fingerprint.
+
+    v1 derived technology before normalization. Bare Aruba CX as a source was
+    therefore a firewall request, not equivalent to a corrected switch request.
+    Hyphenated aliases could not pass the v1 bridge's vendor-code syntax check.
+    """
+    source, target = submission_vendors(source, target)
+    sources = [source] + [alias for alias, code in VENDOR_ALIASES.items()
+                          if code == source and "-" not in alias and device_type_of(source) == "firewall"]
+    targets = [target] + [alias for alias, code in VENDOR_ALIASES.items()
+                          if code == target and "-" not in alias]
+    return tuple((s, t) for s in sources for t in targets)
 
 
 @dataclass
@@ -114,6 +157,9 @@ class Catalog:
 
     @property
     def max_bytes(self) -> int:
+        if self.profile == "external":
+            from .upload_policy import UploadPolicy
+            return UploadPolicy.from_capabilities({"limits": self.limits}).max_bytes
         value = self.limits.get("max_config_bytes")
         return value if isinstance(value, int) and value > 0 else QUICK_LIMIT_BYTES
 

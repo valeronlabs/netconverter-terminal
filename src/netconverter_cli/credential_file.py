@@ -116,7 +116,9 @@ class EncryptedFileStore:
     label_prefix = "encrypted file"
 
     def __init__(self, path: Path | None = None):
-        self.path = Path(path) if path is not None else default_path()
+        selected = (Path(path) if path is not None else default_path()).expanduser()
+        # Canonicalize parent aliases without bypassing final-file O_NOFOLLOW.
+        self.path = selected.parent.resolve() / selected.name
         self._id = os.path.abspath(self.path)
 
     @property
@@ -140,7 +142,8 @@ class EncryptedFileStore:
                     f"Cannot read the passphrase file named by {PASSPHRASE_FILE_ENV} "
                     f"({type(exc).__name__})") from None
             value = value.rstrip("\r\n")
-        if not value and can_prompt():
+        from .credentials import _transaction
+        if not value and can_prompt() and not getattr(_transaction, "active", False):
             source = "prompt"
             what = "a new passphrase for" if creating else "the passphrase for"
             value = getpass.getpass(f"Enter {what} the NetConverter credential file {self.path} "
@@ -247,20 +250,13 @@ class EncryptedFileStore:
 
     @contextmanager
     def _locked(self):
-        """Serialize read-modify-write between processes (POSIX); the replace itself is atomic."""
+        """Whole-file lock, distinct from per-account OAuth transaction locks."""
+        from .credential_lock import CredentialLockError, locked
         try:
-            import fcntl
-        except ImportError:  # Windows: the atomic replace alone
-            yield
-            return
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            with locked(Path(str(self.path) + ".lock")):
+                yield
+        except CredentialLockError:
+            raise FileStoreError("Encrypted credential file is busy or cannot be locked securely") from None
 
     # -- the store interface ---------------------------------------------------
 
@@ -291,9 +287,12 @@ class EncryptedFileStore:
             _NEW_KDF[self._id] = kdf  # the first write uses this salt and its derived key
 
     def get(self, name: str) -> str | None:
-        _, entries = self._load()
-        value = entries.get(name)
-        return value if isinstance(value, str) else None
+        # Readers also participate: on Windows an ordinary open can otherwise
+        # deny atomic replacement while another account is updating the file.
+        with self._locked():
+            _, entries = self._load()
+            value = entries.get(name)
+            return value if isinstance(value, str) else None
 
     def set(self, name: str, value: str) -> None:
         with self._locked():

@@ -24,4 +24,4 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install uv
       - run: uv sync --frozen --group dev
-      - run: uv run pytest tests/test_windows_draft_io.py -q
+      - run: uv run pytest tests/test_windows_draft_io.py tests/test_windows_submission_journal.py tests/test_windows_artifact_publication.py tests/test_windows_source_snapshot.py tests/test_credential_transactions_issue_58.py tests/test_clerk_recovery_issue_11.py -q

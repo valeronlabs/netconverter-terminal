@@ -28,7 +28,7 @@ function Install-NetConverter {
     }
 
     $Package = 'netconverter-cli'
-    $Repo = 'valeronlabs/netconverter_terminals'
+    $Repo = 'valeronlabs/netconverter-terminal'
     $Python = '3.12'
     if (-not $Workspace) { $Workspace = Join-Path $HOME 'migrations' }
     if ($Workspace -like '~*') { $Workspace = Join-Path $HOME $Workspace.Substring(1).TrimStart('\', '/') }

@@ -11,7 +11,7 @@
 set -eu
 
 PACKAGE="netconverter-cli"
-REPO="valeronlabs/netconverter_terminals"
+REPO="valeronlabs/netconverter-terminal"
 PYTHON="3.12"
 YES=0
 CONNECT=1

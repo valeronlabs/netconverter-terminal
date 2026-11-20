@@ -11,7 +11,7 @@ permissions:
   contents: read
 jobs:
   build:
-    if: github.repository == 'valeronlabs/netconverter_terminals'
+    if: github.repository == 'valeronlabs/netconverter-terminal'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

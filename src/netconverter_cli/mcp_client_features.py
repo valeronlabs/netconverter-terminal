@@ -24,8 +24,25 @@ _SHA256 = {"type": "string", "pattern": "^[0-9a-f]{64}$"}
 _JOB_ID = {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,80}$"}
 _COUNT = {"type": "integer", "minimum": 0}
 
+# Fixed public polling field names, never server-supplied prose or metadata values.
+METADATA_FIELDS = (
+    "persisted_block_reason", "translation_chain", "warnings", "failure_reason", "progress",
+    "evidence_executive_summary", "evidence_manual_review_summary", "ai_assistance_state",
+)
+METADATA_NOTICE = (
+    "Some status metadata was omitted from polling because it could not be safely expanded "
+    "or exceeded a size limit. Review the job report before treating this job as ready. "
+    "The stored producer verdict is separate from the effective job_status review hold."
+)
+
 _JOB_SUMMARY = {
     "job_id": _JOB_ID, "status": _STATUS, "verdict": _STATUS, "review_required": {"type": "boolean"},
+    "job_status": {**_STATUS, "description": "Effective server disposition; status is lifecycle and verdict is the stored producer verdict."},
+    "metadata_complete": {"type": "boolean"},
+    "metadata_omitted_fields": {"type": "array", "maxItems": len(METADATA_FIELDS), "uniqueItems": True,
+                                "items": {"enum": list(METADATA_FIELDS)}},
+    "metadata_notice": {"const": METADATA_NOTICE},
+    "reasons_truncated": {"type": "boolean"},
     "progress": {"type": "integer", "minimum": 0, "maximum": 100},
     "stage": {"type": "string", "maxLength": 120},
     "blocking_reason_count": _COUNT, "review_reason_count": _COUNT,
@@ -44,6 +61,23 @@ _GUIDED = {
 }
 
 OUTPUT_SCHEMAS = {
+    "list_workspace_files": {
+        "type": "object",
+        "properties": {
+            "folder": {"type": "string"},
+            "entries": {"type": "array", "maxItems": 100, "items": {
+                "type": "object", "properties": {
+                    "path": {"type": "string"}, "type": {"enum": ["file", "directory"]},
+                    "size_bytes": {"type": ["integer", "null"], "minimum": 0}},
+                "required": ["path", "type", "size_bytes"], "additionalProperties": False}},
+            "has_more": {"type": "boolean"},
+            "next_cursor": {"type": ["string", "null"]},
+            "excluded_entries": _COUNT,
+            "scope": {"type": "string"}, "next_steps": {"type": "string"},
+        },
+        "required": ["folder", "entries", "has_more", "next_cursor", "excluded_entries", "scope", "next_steps"],
+        "additionalProperties": False,
+    },
     "preview_diagram": {
         "type": "object",
         "properties": {"job_id": _JOB_ID, "sha256": _SHA256, "bytes": _COUNT,
@@ -57,6 +91,7 @@ OUTPUT_SCHEMAS = {
     "submit_file": {
         "type": "object",
         "properties": {"job_id": _JOB_ID, "status": _STATUS, "sha256": _SHA256,
+                       "replayed": {"type": "boolean"},
                        "bytes": {"type": "integer", "minimum": 1},
                        "job_type": {"type": "string", "enum": ["prescan"]},
                        "next_steps": {"type": "string"}, "guided_tools": _GUIDED},
@@ -99,6 +134,26 @@ OUTPUT_SCHEMAS = {
         "type": "object",
         "properties": {
             "job_id": _JOB_ID,
+            "complete": {"type": "boolean"},
+            "export_reference": {"type": "object", "properties": {
+                "job_id": _JOB_ID, "artifact_kind": {"const": "evidence-workbook"},
+                "export_id": {"type": "string", "pattern": "^exp_[a-f0-9]{32}$"}},
+                "required": ["job_id", "artifact_kind", "export_id"], "additionalProperties": False},
+            "pending_export": {
+                "type": "object", "properties": {
+                    "export_id": {"type": "string", "pattern": "^exp_[a-f0-9]{32}$"},
+                    "job_id": _JOB_ID,
+                    "state": {"enum": ["queued", "processing", "ready", "failed", "stale"]},
+                    "retry_after_seconds": {"type": "integer", "minimum": 0, "maximum": 3600},
+                    "content_sha256": _SHA256, "bytes": _COUNT,
+                    "failure_code": {"enum": ["export_failed", "export_stale", "export_size_limit",
+                        "export_deadline", "export_queue_expired", "export_renderer_mismatch",
+                        "evidence_unavailable", "evidence_integrity_failed", "export_render_failed"]}},
+                "required": ["export_id", "job_id", "state", "retry_after_seconds"],
+                "additionalProperties": False},
+            "failure": {"type": "object", "properties": {
+                "code": {"type": "string"}, "message": {"type": "string"}},
+                "required": ["code", "message"], "additionalProperties": False},
             "files": {"type": "array", "items": {
                 "type": "object",
                 "properties": {"name": {"type": "string"}, "sha256": _SHA256, "bytes": _COUNT},
@@ -138,8 +193,18 @@ _MEANING = {
 _TEXT = {
     "guided-migration": (
         "Help the engineer migrate a network configuration with NetConverter. Ask for the configuration "
-        "file's PATH inside the workspace folder, the source vendor and, for a conversion, the target "
-        "vendor; call account to see which job types this credential allows. Submit with submit_file "
+        "file's PATH inside the workspace folder (use list_workspace_files when the user asks to choose "
+        "from local files), the source vendor and, for a conversion, the target "
+        "vendor and device type; call account to see which job types this credential allows. "
+        "For guided migration use submit_file(job_type='prescan'), then list_operations and bounded "
+        "get_decision_document views. Ask about applicable decisions, apply the user's choices with "
+        "propose_operations and validate_decision_document at the resulting revision. When listed, "
+        "request_submission_review creates the exact-revision portal review; a URL or pending status "
+        "is not approval. After the user completes review, get_submission_approval retrieves the "
+        "server-issued receipt. Pass its draft_id and approval_ref with the exact revision and a stable "
+        "idempotency_key to submit_conversion; no second bridge confirmation is needed. Refused, "
+        "expired, revoked or changed reviews require a new review, never an invented receipt. "
+        "For other supported job types submit with submit_file "
         "(the user may be asked to confirm the upload), then follow the job with wait_for_job, calling it "
         "again while timed_out is true. Report the verdict (ready, needs review or blocked), the reason "
         "counts and the next step; use the read tools for findings. Offer download for the artifacts; "

@@ -1,7 +1,8 @@
-"""Descriptor-confined input snapshots for the opt-in draft workflow.
+"""Descriptor-confined source snapshots and guided artifact publication.
 
 POSIX uses no-follow descriptor traversal. Windows uses held native handles on
-local NTFS; other platforms fail closed. Legacy Workspace behavior is unaffected.
+local NTFS; other platforms fail closed. Downloads share the publication mechanism.
+Source bodies stay in the transport.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from .workspace import MAX_CONFIG_BYTES, Workspace, WorkspaceError
 
 MAX_DOCUMENT_BYTES = 1_000_000
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 
 
 def secure_publish(workspace: Workspace, draft_id: str, revision: int, content: bytes, sha256: str) -> Path:
@@ -27,20 +29,36 @@ def secure_publish(workspace: Workspace, draft_id: str, revision: int, content: 
 
 
 def secure_publish_file(workspace: Workspace, filename: str, content: bytes, sha256: str, *, max_bytes: int) -> Path:
+    if (type(max_bytes) is not int or not 0 < max_bytes <= MAX_ARTIFACT_BYTES
+            or not isinstance(filename, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,200}", filename)):
+        raise WorkspaceError("Invalid draft artifact")
+    return _publish_file(workspace, filename, content, sha256, max_bytes=max_bytes)
+
+
+def secure_publish_download(workspace: Workspace, filename: str, content: bytes, sha256: str) -> Path:
+    """Generic downloads allow empty verified files and have their own ceiling."""
+    return _publish_file(workspace, filename, content, sha256, max_bytes=MAX_DOWNLOAD_BYTES,
+                         allow_empty=True, require_owner_acl=False)
+
+
+def _publish_file(workspace, filename, content, sha256, *, max_bytes,
+                  allow_empty=False, require_owner_acl=True):
     """Publish verified bytes through held no-follow directory descriptors.
 
     Existing regular files are compared through a bounded descriptor read.
     Atomic hard-link publication never overwrites a destination. A moved root
     fails closed and temporary bytes are removed using the held descriptor.
     """
-    if (not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,200}", filename) or
-            ".." in filename or type(max_bytes) is not int or not 0 < max_bytes <= MAX_ARTIFACT_BYTES or
-            not isinstance(content, bytes) or not 0 < len(content) <= max_bytes or not isinstance(sha256, str) or
+    if (not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,254}", filename) or
+            ".." in filename or type(max_bytes) is not int or not 0 < max_bytes <= MAX_DOWNLOAD_BYTES or
+            not isinstance(content, bytes) or not int(not allow_empty) <= len(content) <= max_bytes or not isinstance(sha256, str) or
             not re.fullmatch(r"[a-f0-9]{64}", sha256) or hashlib.sha256(content).hexdigest() != sha256):
         raise WorkspaceError("Invalid draft artifact")
     if os.name == "nt":
         from .windows_draft_io import publish
-        return publish(workspace, filename, content, sha256)
+        return publish(workspace, filename, content, sha256, allow_empty=allow_empty,
+                       require_owner_acl=require_owner_acl)
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or
             any(fn not in os.supports_dir_fd for fn in (os.open, os.stat, os.link, os.unlink))):
         raise WorkspaceError("Secure draft file access is unavailable on this platform")
@@ -60,7 +78,12 @@ def secure_publish_file(workspace: Workspace, filename: str, content: bytes, sha
         fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
         try:
             before = os.fstat(fd)
-            if not stat.S_ISREG(before.st_mode) or before.st_size != len(content):
+            # Our newly published inode temporarily has two names. An existing
+            # external hard link is never accepted as an idempotent download.
+            ours = os.fstat(artifact_fd) if published and artifact_fd is not None else None
+            expected_links = 2 if ours and (before.st_dev, before.st_ino) == (ours.st_dev, ours.st_ino) else 1
+            if (not stat.S_ISREG(before.st_mode) or before.st_size != len(content)
+                    or before.st_nlink != expected_links):
                 raise WorkspaceError("Artifact destination already exists with different contents")
             chunks, remaining = [], len(content) + 1
             while remaining:
@@ -71,7 +94,7 @@ def secure_publish_file(workspace: Workspace, filename: str, content: bytes, sha
                 remaining -= len(chunk)
             after = os.fstat(fd)
             current = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
-            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
             existing = b"".join(chunks)
             if (identity(before) != identity(after) or identity(current) != identity(after) or
                     existing != content or hashlib.sha256(existing).hexdigest() != sha256):
@@ -125,13 +148,9 @@ def secure_publish_file(workspace: Workspace, filename: str, content: bytes, sha
         os.fsync(root_fd)
         return workspace.root / filename
     except (OSError, WorkspaceError):
-        if published and artifact_fd is not None:
-            try:
-                current, ours = os.stat(filename, dir_fd=root_fd, follow_symlinks=False), os.fstat(artifact_fd)
-                if (current.st_dev, current.st_ino) == (ours.st_dev, ours.st_ino):
-                    os.unlink(filename, dir_fd=root_fd)
-            except OSError:
-                pass
+        # Never unlink a final name after publication. A customer save can
+        # replace it between an inode check and unlinkat; POSIX has no atomic
+        # conditional unlink. Retain possible output and return no receipt.
         raise WorkspaceError("Artifact could not be published securely without replacing a file") from None
     finally:
         if temporary is not None and root_fd is not None:
@@ -146,10 +165,27 @@ def secure_publish_file(workspace: Workspace, filename: str, content: bytes, sha
             os.close(descriptor)
 
 
-def secure_snapshot(workspace: Workspace, filename: str, max_bytes: int = MAX_CONFIG_BYTES) -> tuple[Path, bytes, str]:
+def validate_source_bytes(content: bytes, *, allow_archives: bool = False) -> None:
+    from .upload_policy import is_handoff_archive
+    if is_handoff_archive(content):
+        if allow_archives:
+            return  # Do not unpack or interpret customer bundle members locally.
+        raise WorkspaceError("Handoff ZIPs require full-API conversion file transport; prescan and analysis accept native text only")
+    if not content or b"\x00" in content:
+        raise WorkspaceError("Select bounded UTF-8 configuration text")
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise WorkspaceError("Select UTF-8 configuration text or a supported handoff ZIP") from None
+
+
+def secure_snapshot(workspace: Workspace, filename: str, max_bytes: int = MAX_CONFIG_BYTES, *,
+                    allow_archives: bool = False) -> tuple[Path, bytes, str]:
+    if type(max_bytes) is not int or max_bytes <= 0 or type(allow_archives) is not bool:
+        raise WorkspaceError("Invalid source snapshot limit or format policy")
     if os.name == "nt":
         from .windows_draft_io import snapshot
-        return snapshot(workspace, filename, max_bytes)
+        return snapshot(workspace, filename, max_bytes, allow_archives=allow_archives)
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or
             not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd or
             os.stat not in os.supports_dir_fd):
@@ -164,7 +200,7 @@ def secure_snapshot(workspace: Workspace, filename: str, max_bytes: int = MAX_CO
         relative = candidate.relative_to(workspace.root)
     except ValueError:
         raise WorkspaceError("Path is outside the workspace") from None
-    if not relative.parts or relative.parts[0] == ".netconverter":
+    if not relative.parts or relative.parts[0].casefold() == ".netconverter":
         raise WorkspaceError("Select a configuration outside the client state folder")
     parts = candidate.parts[1:]
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -182,8 +218,10 @@ def secure_snapshot(workspace: Workspace, filename: str, max_bytes: int = MAX_CO
         descriptors.append(fd)
         links.append((parent, parts[-1], fd))
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= max_bytes:
-            raise WorkspaceError("Select a regular nonempty file within the draft input limit")
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise WorkspaceError("Select a regular file with no hard links")
+        if not 0 < before.st_size <= max_bytes:
+            raise WorkspaceError(f"Configuration must be 1–{max_bytes:,} bytes")
         chunks, remaining = [], max_bytes + 1
         while remaining:
             chunk = os.read(fd, min(65_536, remaining))
@@ -194,19 +232,14 @@ def secure_snapshot(workspace: Workspace, filename: str, max_bytes: int = MAX_CO
         content = b"".join(chunks)
         after = os.fstat(fd)
         identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-        if identity(before) != identity(after) or len(content) != before.st_size:
+        if identity(before) != identity(after) or after.st_nlink != 1 or len(content) != before.st_size:
             raise WorkspaceError("The input changed while it was being read")
         for parent_fd, name, child_fd in links:
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             opened = os.fstat(child_fd)
             if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
                 raise WorkspaceError("The input path changed while it was being read")
-        if not content or len(content) > max_bytes or b"\x00" in content:
-            raise WorkspaceError("Select bounded UTF-8 configuration text")
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError:
-            raise WorkspaceError("Select UTF-8 configuration text") from None
+        validate_source_bytes(content, allow_archives=allow_archives)
         return candidate, content, hashlib.sha256(content).hexdigest()
     except OSError:
         raise WorkspaceError("Draft input could not be read securely") from None

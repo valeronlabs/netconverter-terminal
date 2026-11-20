@@ -1,7 +1,7 @@
 # Releasing the NetConverter CLI
 
 A release is a `v<version>` tag on the public repository
-`valeronlabs/netconverter_terminals`. The [Release workflow](../.github/workflows/release.yml)
+`valeronlabs/netconverter-terminal`. The [Release workflow](../.github/workflows/release.yml)
 then tests and builds the package, publishes it to PyPI as
 [`netconverter-cli`](https://pypi.org/project/netconverter-cli/) with trusted publishing
 (no API token anywhere), and only then creates the GitHub Release with the wheel and
@@ -13,25 +13,28 @@ carry the same file without publishing anything.
 
 ## One-time setup (founder)
 
-Do these once, before the first tag. Nothing can be published until they exist.
+Verify these settings before the next approved tag. The public repository is
+`valeronlabs/netconverter-terminal`; the private authoring repository remains
+`devnexthop/netconverter_terminals`. A repository rename also requires the PyPI
+trusted-publisher binding to use the current public repository name.
 
 1. **PyPI account.** Sign in to <https://pypi.org> with the ValeronLabs account (create it
    if needed) and turn on two-factor authentication (required for publishing).
-2. **Pending trusted publisher** (this also reserves the name; `netconverter-cli` is free
-   on PyPI today). PyPI → *Your account* → **Publishing** →
-   *Add a new pending publisher* → **GitHub**:
+2. **Existing project trusted publisher.** `netconverter-cli` is already published.
+   PyPI → *Your projects* → **netconverter-cli** → **Publishing**. Verify or
+   update the GitHub trusted-publisher binding for the existing project:
 
    | Field | Value |
    |---|---|
    | PyPI Project Name | `netconverter-cli` |
    | Owner | `valeronlabs` |
-   | Repository name | `netconverter_terminals` |
+   | Repository name | `netconverter-terminal` |
    | Workflow name | `release.yml` |
    | Environment name | `pypi` |
 
    The project is created on the first successful publish; the pending publisher then
    becomes a normal trusted publisher of that project.
-3. **GitHub environment.** <https://github.com/valeronlabs/netconverter_terminals> →
+3. **GitHub environment.** <https://github.com/valeronlabs/netconverter-terminal> →
    *Settings* → *Environments* → **New environment** → `pypi`. Recommended:
    *Required reviewers* = the founder (each publish waits for approval) and
    *Deployment branches and tags* → *Selected* → tag rule `v*`.

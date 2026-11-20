@@ -7,10 +7,12 @@ available, else the encrypted file; reads check both), ``keyring`` or ``file``.
 """
 
 import getpass
+import hashlib
 import os
 import sys
 import threading
 import time
+from contextlib import ExitStack
 
 import keyring
 
@@ -22,6 +24,7 @@ SERVICE = "NetConverter Terminal"
 KEYRING_TIMEOUT_S = 5.0
 _RETRY_LOCKED_AFTER_S = 30.0
 _locked_at: float | None = None
+_transaction = threading.local()
 
 
 class KeyringLocked(RuntimeError):
@@ -39,13 +42,17 @@ def _timeout() -> float:
         return KEYRING_TIMEOUT_S
 
 
-def _bounded(call, *args):
+def _bounded(call, *args, _cooldown=True):
     """Run one keyring call with a deadline; a call that never returns means locked.
 
     After one timeout, calls fail fast for a while instead of each waiting again.
     """
     global _locked_at
-    if _locked_at is not None and time.monotonic() - _locked_at < _RETRY_LOCKED_AFTER_S:
+    if getattr(_transaction, "active", False):
+        # The transaction's worker owns the OS lock. Never spawn a second
+        # worker that could outlive that lock after an inner timeout.
+        return call(*args)
+    if _cooldown and _locked_at is not None and time.monotonic() - _locked_at < _RETRY_LOCKED_AFTER_S:
         raise KeyringLocked()
     box = {}
 
@@ -59,9 +66,11 @@ def _bounded(call, *args):
     worker.start()
     worker.join(_timeout())
     if worker.is_alive():
-        _locked_at = time.monotonic()
+        if _cooldown:
+            _locked_at = time.monotonic()
         raise KeyringLocked()
-    _locked_at = None
+    if _cooldown:
+        _locked_at = None
     if "error" in box:
         raise box["error"]
     return box.get("value")
@@ -224,6 +233,63 @@ class CredentialStoreError(RuntimeError):
     """Nothing can store the credential; the message says why (never a secret)."""
 
 
+def token_transaction(account, operation, *, writing=False):
+    """Run an issuer/client account operation on pinned stores under OS locks.
+
+    The deadline applies to the caller, not the worker: a late keyring call
+    retains every lock until it completes. OAuth HTTP never runs here.
+    """
+    from .credential_lock import lock_root, locked
+    from .credential_file import can_prompt, FileStoreError
+
+    # An interactive passphrase belongs to the caller, before taking account
+    # locks or starting a deadline worker. Never leave a timed-out worker
+    # waiting for terminal input while it owns the credential transaction.
+    try:
+        if can_prompt() and store_choice() != "keyring":
+            fallback = _file_store()
+            if writing or fallback.exists():
+                os_store = _keyring_store() if store_choice() == "auto" else None
+                if os_store is None or (not writing and not os_store.get(account + ":access")):
+                    fallback.prepare()
+    except KeyringLocked:
+        raise
+    except FileStoreError as exc:
+        raise CredentialStoreError(str(exc)) from None
+    except Exception:
+        raise CredentialStoreError("Could not prepare the credential store; unlock the store and retry") from None
+
+    def run():
+        _transaction.active = True
+        try:
+            stores = _read_stores()
+            writer = _write_store()
+
+            def identity(store):
+                if isinstance(store, _Keyring):
+                    return "keyring:" + store.backend.__class__.__module__
+                path = str(store.path)
+                return "file:" + (path.casefold() if os.name == "nt" or sys.platform == "darwin" else path)
+
+            candidates = {identity(s): s for s in [*stores, *([writer] if writer is not None else [])]}
+            with ExitStack() as stack:
+                for scope, store in sorted(candidates.items()):
+                    digest = hashlib.sha256(f"{scope}\0{account}".encode()).hexdigest()
+                    path = (lock_root() / (digest + ".lock") if isinstance(store, _Keyring)
+                            else store.path.with_name(store.path.name + ".oauth-" + digest + ".lock"))
+                    stack.enter_context(locked(path))
+                return operation([(identity(s), s) for s in stores],
+                                 (identity(writer), writer) if writer is not None else None)
+        except (KeyringLocked, CredentialStoreError):
+            raise
+        except Exception:
+            raise CredentialStoreError("Could not complete the atomic credential-store operation; unlock the store and retry") from None
+        finally:
+            _transaction.active = False
+
+    return _bounded(run, _cooldown=store_choice() != "file")
+
+
 def _file_problem() -> str | None:
     """None when the file store is not involved; "" when it answers; else why it doesn't."""
     if store_choice() == "keyring":
@@ -266,6 +332,22 @@ def keyring_problem() -> str:
                     f"unreachable (keyring backend: {name})")
         return f"the Secret Service keyring did not answer on the D-Bus session bus (keyring backend: {name})"
     return f"no OS credential store is available (keyring backend: {name})"
+
+
+def credential_access_hint() -> str:
+    """Platform-specific recovery guidance; no credential reads or policy changes."""
+    if sys.platform.startswith("linux"):
+        return ("Start this MCP server with DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus "
+                "in its environment, or configure NETCONVERTER_API_KEY through the client's protected "
+                "credential settings; then restart it. Never paste credentials into chat.")
+    if sys.platform == "darwin":
+        return ("Run the bridge as the same macOS user who signed in. Check that the login Keychain "
+                "is unlocked and permit the selected Terminal/Python executable in the macOS prompt "
+                "if requested; then reconnect the assistant. Run `netconverter whoami` from that "
+                "same installation. Do not paste credentials into chat or disable Keychain protection.")
+    return ("Run the bridge as the same signed-in operating-system user and check access to the "
+            "credential store from that installation with `netconverter whoami`; then reconnect "
+            "the assistant. Never paste credentials into chat.")
 
 
 def _os_backend():

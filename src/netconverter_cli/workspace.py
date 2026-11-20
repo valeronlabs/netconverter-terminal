@@ -21,6 +21,7 @@ class Workspace:
     def __init__(self, root: Path | str):
         self.root = Path(root).resolve(strict=True)
         self.state_dir = self.root / ".netconverter"
+        self._artifact_receipts = {}
 
     def _inside(self, path: Path) -> Path:
         resolved = path.resolve()
@@ -43,34 +44,19 @@ class Workspace:
         if candidate.is_symlink():
             raise WorkspaceError("Symbolic links are not accepted; pass the real file")
         resolved = self._inside(candidate)
-        if resolved == self.state_dir or resolved.is_relative_to(self.state_dir):
+        relative = resolved.relative_to(self.root)
+        # Path.resolve() on case-insensitive macOS does not canonicalize case.
+        # Reserve every case spelling, as the native Windows reader also does.
+        if relative.parts and relative.parts[0].casefold() == ".netconverter":
             raise WorkspaceError("The client state folder is not a configuration source")
         return resolved
 
     def snapshot(
-        self, filename: str, max_bytes: int = MAX_CONFIG_BYTES
+        self, filename: str, max_bytes: int = MAX_CONFIG_BYTES, *, allow_archives: bool = False
     ) -> tuple[Path, bytes, str]:
         path = self.locate(filename)
-        if not path.is_file():
-            raise WorkspaceError("Select a regular configuration file")
-        # Bound the read, including when the source changes during the read.
-        with path.open("rb") as stream:
-            content = stream.read(max_bytes + 1)
-        if not content or len(content) > max_bytes:
-            raise WorkspaceError(
-                "Free pilot inputs must be 1–50,000 bytes; contact NetConverter for larger files"
-                if max_bytes == MAX_CONFIG_BYTES
-                else f"Configuration must be 1–{max_bytes:,} bytes"
-            )
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError:
-            raise WorkspaceError(
-                "Select a UTF-8 text, SET, or XML configuration"
-            ) from None
-        if b"\x00" in content:
-            raise WorkspaceError("Binary configurations are not supported")
-        return path, content, hashlib.sha256(content).hexdigest()
+        from .draft_io import secure_snapshot
+        return secure_snapshot(self, str(path), max_bytes, allow_archives=allow_archives)
 
     def load(self) -> dict:
         path = self._inside(self.state_dir / "session.json")
@@ -109,40 +95,29 @@ class Workspace:
     def save_artifact(
         self, job_id: str, filename: str, content: bytes, sha256: str
     ) -> Path:
-        if not _IDENTIFIER.fullmatch(job_id):
+        if not isinstance(job_id, str) or not _IDENTIFIER.fullmatch(job_id):
             raise WorkspaceError("Invalid server job ID")
         if (
-            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", filename)
+            not isinstance(filename, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", filename)
             or ".." in filename
         ):
             raise WorkspaceError("Invalid artifact filename")
         if (
-            not re.fullmatch(r"[a-f0-9]{64}", sha256)
+            not isinstance(content, bytes) or not isinstance(sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", sha256)
             or hashlib.sha256(content).hexdigest() != sha256
         ):
             raise WorkspaceError("Artifact checksum failed; no file was written")
-        path = self.root / f"{job_id}.{filename}"
-        if path.is_symlink():
-            raise WorkspaceError("Artifact destination is a symlink")
-        if path.exists():
-            if path.read_bytes() == content:
-                return path
-            raise WorkspaceError(
-                "Artifact destination already exists with different contents"
-            )
-        fd, temporary = tempfile.mkstemp(prefix=".nc-download-", dir=self.root)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            # Atomic no-clobber publication, including a concurrent user write.
-            try:
-                os.link(temporary, path)
-            except FileExistsError:
-                raise WorkspaceError(
-                    "Artifact destination was created during download"
-                ) from None
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+        from .draft_io import secure_publish_download
+        path = secure_publish_download(self, f"{job_id}.{filename}", content, sha256)
+        # Receipts describe bytes verified at publication, never a subsequent
+        # mutable pathname read. No document contents are retained here.
+        self._artifact_receipts[path] = {"sha256": sha256, "bytes": len(content)}
         return path
+
+    def artifact_receipt(self, path: Path | str) -> dict:
+        receipt = self._artifact_receipts.get(Path(path))
+        if receipt is None:
+            raise WorkspaceError("No verified publication receipt exists for this artifact")
+        return dict(receipt)

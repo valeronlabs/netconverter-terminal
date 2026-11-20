@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "netconverter-cli"
-version = "0.7.3"
+version = "0.8.0"
 description = "NetConverter CLI — any-vendor network configuration migration, validation and optimization, and a local MCP bridge for your AI assistant"
 readme = "README.md"
 license = "LicenseRef-NetConverter-Proprietary"
@@ -34,10 +34,10 @@ dependencies = ["httpx==0.28.1", "textual==8.2.8", "keyring==25.7.0", "pydantic=
 
 [project.urls]
 Homepage = "https://netconverter.ai"
-Repository = "https://github.com/valeronlabs/netconverter_terminals"
-Documentation = "https://github.com/valeronlabs/netconverter_terminals/blob/main/QUICK_START.md"
-Issues = "https://github.com/valeronlabs/netconverter_terminals/issues"
-Changelog = "https://github.com/valeronlabs/netconverter_terminals/blob/main/CHANGELOG.md"
+Repository = "https://github.com/valeronlabs/netconverter-terminal"
+Documentation = "https://github.com/valeronlabs/netconverter-terminal/blob/main/QUICK_START.md"
+Issues = "https://github.com/valeronlabs/netconverter-terminal/issues"
+Changelog = "https://github.com/valeronlabs/netconverter-terminal/blob/main/CHANGELOG.md"
 
 [project.scripts]
 netconverter = "netconverter_cli.cli:main"

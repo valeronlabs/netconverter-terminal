@@ -25,11 +25,15 @@ import uuid
 from pathlib import Path
 
 from . import __version__, activity, update
-from .api import APIError, Client, ExternalClient
-from .backend import EXTERNAL_MAX_BYTES, detect_profile, download_external, submit_external
+from .api import APIError, Client, ExternalClient, document_export_query
+from .backend import (EXTERNAL_MAX_BYTES, archive_submission_allowed, detect_profile,
+                      download_external_resumable, submit_external)
+from .catalog import legacy_submission_vendors, submission_vendors
 from .clerk import ClerkError, ClerkSession
+from .upload_policy import UploadPolicy
+from .submission_journal import SubmissionJournal, credential_scope
 from .controller import fetch_artifacts
-from .credentials import keyring_problem
+from .credentials import credential_access_hint, keyring_problem
 from . import errors, job_options, mcp_workflows
 from . import exposure as _exposure
 from . import mcp_client_features as _features
@@ -39,6 +43,7 @@ from .drafts import DraftClient, DraftService
 from .privacy import STATUSES
 from .remote_mcp import RemoteError, RemoteMCP
 from .workspace import MAX_CONFIG_BYTES, Workspace, WorkspaceError
+from .workspace_listing import WorkspaceListing
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_NAME = "netconverter-local"
@@ -103,9 +108,11 @@ REMOTE_TOOLS_DEFAULT = frozenset({
     "get_vpn_summary", "get_zone_summary", "kb_explain", "kb_search", "list_jobs",
     "list_objects_with_attribute", "list_rules_matching", "query_ir", "search",
     "select_job", "simulate_flow", "vendor_capability_lookup",
+    # Ranked readiness holds from the stored evidence (aws#1494); scrubbed like get_evidence.
+    "why_needs_review",
     "get_mapping_questions", "validate_mapping", "apply_mapping_answers",
     "list_operations", "get_decision_document", "validate_decision_document",
-    "propose_operations", "submit_conversion",
+    "propose_operations", "submit_conversion", "request_submission_review", "get_submission_approval",
     # Lowers the server's view for this MCP session (never raises it); the bridge still
     # sends its own level on every request and filters every result to it.
     "set_view_level",
@@ -118,14 +125,19 @@ MAPPING_TOOLS = frozenset({"get_mapping_questions", "validate_mapping", "apply_m
 REMOTE_TOOLS_STRICT = frozenset({
     "list_jobs", "select_job", "get_account", "search", "fetch", "kb_search", "kb_explain",
     "vendor_capability_lookup", "get_job_brief", "get_evidence", "get_report", "get_diagram",
+    "why_needs_review",
 }) | MAPPING_TOOLS
 assert REMOTE_TOOLS_STRICT <= REMOTE_TOOLS_DEFAULT
+# Remote tools added after servers already in the field: an allowlisted name the server
+# does not advertise gets "needs a newer NetConverter server" instead of unknown_tool.
+SERVER_ADDED_TOOLS = frozenset({"why_needs_review", "request_submission_review", "get_submission_approval"})
+assert SERVER_ADDED_TOOLS <= REMOTE_TOOLS_DEFAULT
 # Guided migration over a prescan (aws#1090): read the decisions, record the user's
 # choices, queue the conversion. The last two are write tools the server lists only to
 # an enrolled tenant in its default view, and gates and audits per call; a strict
 # (masked) session never sees them.
-GUIDED_READ_TOOLS = ("list_operations", "get_decision_document", "validate_decision_document")
-GUIDED_WRITE_TOOLS = ("propose_operations", "submit_conversion")
+GUIDED_READ_TOOLS = ("list_operations", "get_decision_document", "validate_decision_document", "get_submission_approval")
+GUIDED_WRITE_TOOLS = ("propose_operations", "submit_conversion", "request_submission_review")
 GUIDED_TOOLS = GUIDED_READ_TOOLS + GUIDED_WRITE_TOOLS
 # ``submit_*`` stays blocked (a remote submit would take configuration text through the
 # model); submit_conversion takes only a prescan id and a revision.
@@ -136,8 +148,13 @@ PRESCAN_NEXT_STEPS = (
     "The job stops at the prescan; nothing is converted yet. When wait_for_job reports it "
     "completed, call list_operations, get_decision_document and validate_decision_document "
     "with this job_id. Ask the user about every decision (never assume skip), record the "
-    "choices with propose_operations (pass base_sha256), then, with the user's OK, "
-    "submit_conversion(job_id, revision) queues the conversion as a new job. "
+    "choices with propose_operations (pass base_sha256), then validate the exact revision. "
+    "When request_submission_review and get_submission_approval are listed, request a review "
+    "for that revision and have the user complete its portal review. Read get_submission_approval; "
+    "only a server-issued approved receipt authorizes submit_conversion with the same revision, "
+    "draft_id, approval_ref and a stable idempotency_key. That receipt needs no second bridge "
+    "confirmation. A pending review URL is not approval. On older servers, submit_conversion "
+    "uses the existing confirmation flow. "
     "The write tools are listed only at exposure level full and where the tenant has them "
     "enabled; account says which.")
 CONFIRM_TTL_S = 600
@@ -240,7 +257,9 @@ def mask_addresses(value, depth: int = 0):
     return value
 
 INSTRUCTIONS = (
-    "NetConverter local bridge. To work on a configuration, pass its file PATH "
+    "NetConverter local bridge. Use list_workspace_files to discover local file names and sizes. "
+    "To start a guided migration, pass the selected file PATH to submit_file with job_type='prescan'. "
+    "To work on a configuration, pass its file PATH "
     "(inside the configured workspace folder) to submit_file. Never paste, quote "
     "or reconstruct configuration text in a tool call; this server reads the file "
     "and uploads it directly to NetConverter. Results are summaries; on an explicit request, "
@@ -256,6 +275,29 @@ CONFIRM_TOKEN_SCHEMA = {
 }
 
 LOCAL_TOOLS = [
+    {
+        "name": "list_workspace_files",
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+        "description": (
+            "List a bounded page of local workspace file names, sizes and directories; no file contents. "
+            "Nonrecursive and confined to the human-selected workspace; hidden files, client state and "
+            "unsafe links are excluded. Requires exposure level full because filenames may contain "
+            "sensitive names or addresses. Select a relative file path, then submit_file with job_type='prescan' "
+            "starts a guided migration without a manual UI prescan. POSIX only; on other platforms submit "
+            "a known path. A listing does not prove format support or upload eligibility." + _DATA_NOTE
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "default": ".", "maxLength": 1024,
+                           "description": "Relative directory inside the configured workspace."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "cursor": {"type": "string", "maxLength": 1024,
+                           "description": "Opaque next_cursor from this folder; restart listing after changes or expiry."},
+            },
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "submit_file",
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
@@ -332,7 +374,13 @@ LOCAL_TOOLS = [
         "description": (
             "Download a job's artifacts into a folder inside the workspace (hash-verified, "
             "never overwriting different files). For a diagram, pass the artifact request returned "
-            "by get_diagram as diagram. Returns file names, sizes and SHA-256 "
+            "by get_diagram as diagram. Only when requested, export_kind='decision-yaml' downloads "
+            "a prescan revision or a conversion's frozen effective YAML; export_kind='source-ncir' "
+            "downloads verified source Stage-2.5 NCIR. These files never enter the model response. "
+            "Conversion downloads can return complete=false with verified saved files and a pending_export. "
+            "Resume only that workbook with artifact_kind=evidence-workbook and its export_id after retry_after_seconds. "
+            "Failures retain saved receipts; never claim a complete bundle or blindly prepare again. "
+            "Returns file names, sizes and SHA-256 "
             "only; use preview_diagram if the user asks to see a PNG in chat." + _DATA_NOTE
         ),
         "inputSchema": {
@@ -340,6 +388,15 @@ LOCAL_TOOLS = [
             "properties": {
                 "job_id": {"type": "string"},
                 "diagram": DiagramArtifact.model_json_schema(),
+                "export_kind": {"type": "string", "enum": ["decision-yaml", "source-ncir"]},
+                "artifact_kind": {"type": "string", "enum": ["evidence-workbook"],
+                                  "description": "Prepare or resume only the evidence workbook, leaving primary files untouched."},
+                "export_id": {"type": "string", "pattern": "^exp_[a-f0-9]{32}$",
+                              "description": "Exact pending workbook ID; requires artifact_kind=evidence-workbook."},
+                "revision": {"type": "integer", "minimum": 0, "maximum": 10000,
+                             "description": "Prescan decision YAML revision only; omit for a conversion's effective YAML."},
+                "expected_document_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$",
+                                             "description": "Optional revision-bound decision-document hash from the overview."},
                 "dest_dir": {"type": "string", "description": "Destination folder inside the workspace; '.' for the workspace root.", "default": "."},
             },
             "required": ["job_id"],
@@ -406,17 +463,74 @@ def _api_failure(exc: APIError) -> ToolFailure:
                        f"NetConverter refused the request ({exc.code}, HTTP {exc.status}){reason}", **extra)
 
 
+def _submission_api_failure(exc: APIError) -> ToolFailure:
+    """Source transport errors must not copy source-derived server prose to MCP.
+
+    CLI/TUI APIError text stays available locally. Model-facing submission
+    failures use a closed vocabulary and locally authored recovery guidance.
+    """
+    reasons = {
+        "request_failed": "Check submission status before retrying; inspect detailed errors locally.",
+        "unprocessable": "Check the source/target path, device type, source format and options with netconverter capabilities; inspect detailed validation locally.",
+        "bad_request": "Check submission options and the advertised source/target path with netconverter capabilities.",
+        "forbidden": "This credential lacks permission or plan entitlement; check netconverter capabilities.",
+        "unauthorized": "Sign in again or check the configured credential.",
+        "not_found": "The requested resource or route is unavailable; check the server and current access.",
+        "rate_limited": "Submission capacity is unavailable; wait before retrying the same request.",
+        "quota_exceeded": "The account quota is exhausted; check account limits before retrying.",
+        "storage_quota_exceeded": "Account storage is insufficient for this file. Review retained files in NetConverter My Files; "
+                                  "remove only files you choose or ask your administrator about storage capacity. "
+                                  "Do not resubmit until sufficient storage is available.",
+        "inflight_limit_exceeded": "Wait for an active job to finish before retrying the same request.",
+        "configuration_too_large": "The source exceeds the negotiated upload limit; check netconverter capabilities.",
+        "archive_requires_file_conversion": "ZIP bundles require full-API conversion with file-ID transport; native text is required for other job types.",
+        "invalid_configuration_encoding": "Use nonempty UTF-8 text without NUL bytes, or a supported conversion ZIP.",
+        "upload_checksum_mismatch": "The upload checksum or byte count did not match; no job was queued by this attempt.",
+        "invalid_upload_receipt": "The server upload receipt is invalid; no job was queued by this attempt.",
+        "upload_capability_changed": "Upload capabilities changed; reconcile the original pending submission.",
+        "invalid_upload_policy": "The server upload policy is unavailable or invalid; refresh capabilities before retrying.",
+        "connection_failed": "The response was interrupted; preserve the pending receipt and retry the same request.",
+        "invalid_response": "The response is not usable; preserve the pending receipt and reconcile submission status.",
+        "unsupported_conversion": "This conversion path is unsupported; check netconverter capabilities for supported alternatives.",
+        "unsupported_source_vendor": "Choose an advertised source vendor and device type from netconverter capabilities.",
+        "unsupported_target_vendor": "Choose an advertised destination vendor and device type from netconverter capabilities.",
+        "unsupported_job_type": "Choose a job type advertised for this credential by netconverter capabilities.",
+    }
+    code = exc.code if isinstance(exc.code, str) and exc.code in reasons else "request_failed"
+    request_id = exc.request_id if isinstance(exc.request_id, str) and re.fullmatch(
+        r"req_[a-fA-F0-9]{8,64}", exc.request_id) else ""
+    allowed_fields = {"source_vendor", "target_vendor", "source_config", "file_id",
+                      "job_type", "technology", "options"}
+    fields = exc.detail.get("fields", []) if isinstance(exc.detail, dict) else []
+    safe_fields = sorted({field for field in fields[:50] if isinstance(field, str)
+                          and field in allowed_fields}) if isinstance(fields, list) else []
+    if code == "storage_quota_exceeded":
+        safe_fields = []  # Storage refusal does not establish missing configuration options.
+    guidance = reasons[code]
+    if code == "request_failed":
+        category = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+                    413: "configuration_too_large", 422: "unprocessable", 429: "rate_limited"}.get(exc.status)
+        guidance = reasons.get(category, guidance)
+    failure = _api_failure(APIError(exc.status, code, request_id,
+                                   detail={"fields": safe_fields}, message=guidance))
+    if code == "storage_quota_exceeded" and isinstance(exc.detail, dict):
+        # Closed numeric metadata only. Never echo a server explanation, path,
+        # source text, credential, bool or arbitrarily large JSON integer.
+        quota = {name: exc.detail[name] for name in ("requested_bytes", "available_bytes", "used_bytes", "limit_bytes")
+                 if type(exc.detail.get(name)) is int and 0 <= exc.detail[name] <= 2**53 - 1}
+        if quota:
+            failure.extra["storage_quota"] = quota
+    return failure
+
+
 def _no_credential() -> ToolFailure:
     """Why there is no credential: an unreachable keyring (#17) is not "not signed in"."""
     problem = keyring_problem()
     if problem:
         return ToolFailure(
             "keyring_unreachable",
-            f"No NetConverter credential is reachable from this AI client: {problem}. The sign-in "
-            "in the OS keyring cannot be read here. Fix: start this MCP server with "
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus in its environment (Codex: "
-            "env_vars; Cursor and OpenClaw: env), or set NETCONVERTER_API_KEY there; then restart "
-            "the client. New user? Run `netconverter login --clerk` in a terminal first.",
+            f"No NetConverter credential is reachable from this AI client: {problem}. "
+            + credential_access_hint(),
         )
     # The bridge looks for a credential again on the next call, so no restart is needed (#21).
     return ToolFailure("not_signed_in", errors.SIGNED_OUT)
@@ -447,6 +561,7 @@ class Bridge:
                  level: str | None = None, sections=(), workspace_level: bool = False,
                  upload_confirm: bool = True):
         self.workspace = Workspace(workspace)
+        self._workspace_listing = WorkspaceListing(self.workspace)
         # Called again while there is no credential, so a sign-in made after the
         # bridge started is used on the next call (#21). Returns choose_mcp_credential's tuple.
         self._credential_loader = credential_loader
@@ -472,6 +587,7 @@ class Bridge:
         self._transport = transport
         self._profile: tuple[str, frozenset] | None = None
         self._remote_names: dict[str, str] = {}
+        self._prescan_receipts = False
         self.progress = None  # set by the stdio server while a call carries a progressToken
         # Set by the stdio server while submit_file runs for a client with form elicitation (#20):
         # called with the upload's path/size/hash, returns accept/decline/cancel, or None to proceed.
@@ -486,6 +602,14 @@ class Bridge:
         self._confirm_tokens: dict[str, tuple] = {}
         self._sleep, self._clock = time.sleep, time.monotonic
         self.client_name = ""  # the AI client's own name from initialize, for the activity log
+
+    def list_workspace_files(self, folder=".", limit=50, cursor=None):
+        if self.exposure.level != "full":
+            raise ToolFailure("full_exposure_required", "File names require this workspace's full exposure level. The user can change it in Terminal with 'netconverter privacy level full'; otherwise supply a known relative file path.")
+        try:
+            return self._workspace_listing.list(folder=folder, limit=limit, cursor=cursor)
+        except WorkspaceError as exc:
+            raise ToolFailure("workspace_listing_refused", str(exc)) from None
 
     # -- REST clients ------------------------------------------------------
 
@@ -515,7 +639,7 @@ class Bridge:
             raise _no_credential()
         return cls(self.rest_credential, self.server, transport=self._transport)
 
-    def profile(self) -> tuple[str, frozenset]:
+    def profile(self, *, source_submission: bool = False) -> tuple[str, frozenset]:
         """('external', job types) for full API credentials, ('quick', ...) for terminal keys."""
         self._reload_credential()
         if self._profile:
@@ -525,7 +649,7 @@ class Bridge:
         try:
             self._profile = detect_profile(self.rest_credential, self.server, transport=self._transport)
         except APIError as exc:
-            raise _api_failure(exc) from None
+            raise (_submission_api_failure(exc) if source_submission else _api_failure(exc)) from None
         return self._profile
 
     @property
@@ -612,10 +736,10 @@ class Bridge:
         if job_type not in JOB_TYPES:
             raise ToolFailure("invalid_arguments",
                               f"job_type must be one of {', '.join([*JOB_TYPES, *JOB_TYPE_ALIASES])}")
-        if not isinstance(source_vendor, str) or not _VENDOR.fullmatch(source_vendor):
-            raise ToolFailure("invalid_arguments", "source_vendor must be a vendor code such as cisco_asa")
-        if target_vendor is not None and (not isinstance(target_vendor, str) or not _VENDOR.fullmatch(target_vendor)):
-            raise ToolFailure("invalid_arguments", "target_vendor must be a vendor code such as palo_alto_set")
+        try:
+            source_vendor, target_vendor = submission_vendors(source_vendor, target_vendor)
+        except ValueError as exc:
+            raise ToolFailure("invalid_arguments", str(exc)) from None
         options = options or {}
         if len(json.dumps(options, default=str)) > MAX_OPTIONS_CHARS:  # size first: it says where big files go
             raise _options_too_large(options)
@@ -628,7 +752,7 @@ class Bridge:
                 raise WorkspaceError("Select a regular configuration file")
         except WorkspaceError as exc:
             raise ToolFailure("invalid_path", str(exc)) from None
-        kind, job_types = self.profile()
+        kind, job_types = self.profile(source_submission=True)
         try:
             job_options.check(options, job_type, target_vendor, profile=kind, allow_document=False)
         except job_options.OptionsError as exc:
@@ -645,15 +769,65 @@ class Bridge:
         if job_type == "convert" and not target_vendor:
             raise ToolFailure("invalid_arguments", "target_vendor is required for convert")
 
+        policy = None
+        if kind == "external":
+            client = self._client(ExternalClient)
+            try:
+                policy = UploadPolicy.fetch(client)
+            except APIError as exc:
+                raise _submission_api_failure(exc) from None
+            finally:
+                client.close()
         try:
-            _, content, digest = self.workspace.snapshot(
-                path, MAX_CONFIG_BYTES if kind == "quick" else EXTERNAL_MAX_BYTES
+            source_path, content, digest = self.workspace.snapshot(
+                path, MAX_CONFIG_BYTES if kind == "quick" else policy.max_bytes,
+                allow_archives=bool(kind == "external" and archive_submission_allowed(
+                    policy, source_vendor, job_type)),
             )
         except WorkspaceError as exc:
             raise ToolFailure("invalid_path", str(exc)) from None
-        relative = str(self.workspace.locate(path).relative_to(self.workspace.root))
+        relative = str(source_path.relative_to(self.workspace.root))
         details = {"path": relative, "bytes": len(content), "sha256": digest, "job_type": job_type,
                    "source_vendor": source_vendor, "target_vendor": target_vendor}
+        if kind == "external":
+            binding = {**details, "options": options, "server": self.server,
+                       "credential": credential_scope(self.rest_credential),
+                       "exposure": self.exposure.level,
+                       "exposure_sections": sorted(self.exposure.sections)}
+            try:
+                legacy_bindings = [{**binding, "source_vendor": source, "target_vendor": target}
+                                   for source, target in legacy_submission_vendors(source_vendor, target_vendor)]
+                with SubmissionJournal(self.workspace, relative, binding, legacy_bindings=legacy_bindings).locked() as journal:
+                    previous = journal.record.get("result")
+                    if previous:
+                        # Authenticate and check current job access before replaying a local receipt.
+                        receipt = self._submission_receipt(previous, digest, len(content), job_type)
+                        self._job_summary(receipt["job_id"], source_submission=True)
+                        return {**receipt, "replayed": True}
+                    first_attempt = not journal.record
+                    if first_attempt:
+                        self._confirm(self.confirm_upload, details, ("submit_file", journal.binding), confirm_token,
+                                      ("upload_declined", f"upload {relative} ({len(content):,} bytes) for {job_type}"))
+                        journal.start()
+                    try:
+                        result = self._submit_external(content, source_vendor, target_vendor, job_type, options,
+                                                       journal.record["key"], policy=policy,
+                                                       uploaded=journal.record.get("uploaded"),
+                                                       save_upload=journal.uploaded,
+                                                       legacy_vendors=journal.legacy_vendors)
+                    except APIError as exc:
+                        if first_attempt:
+                            journal.forget_initial_refusal(exc)
+                        raise
+                    out = self._submission_receipt(result, digest, len(content), job_type)
+                    journal.completed(out)
+            except WorkspaceError as exc:
+                raise ToolFailure("submission_pending", str(exc)) from None
+            except APIError as exc:
+                raise _submission_api_failure(exc) from None
+            self._log("submit_file", path=relative, source_vendor=source_vendor,
+                      target_vendor=target_vendor, **{**out, "job_type": job_type})
+            return out
         # #20/#37: the client's own dialog (or the conversation's yes), before anything is sent
         self._confirm(self.confirm_upload, details,
                       ("submit_file", relative, digest, job_type, source_vendor, target_vendor), confirm_token,
@@ -663,15 +837,20 @@ class Bridge:
             if kind == "quick":
                 result = self._submit_quick(content, digest, source_vendor, target_vendor, job_type, options, key)
             else:
-                result = self._submit_external(content, source_vendor, target_vendor, job_type, options, key)
+                result = self._submit_external(content, source_vendor, target_vendor, job_type, options, key,
+                                               policy=policy)
         except APIError as exc:
-            raise _api_failure(exc) from None
+            raise _submission_api_failure(exc) from None
+        out = self._submission_receipt(result, digest, len(content), job_type)
+        self._log("submit_file", path=relative, source_vendor=source_vendor,
+                  target_vendor=target_vendor, **{**out, "job_type": job_type})
+        return out
+
+    def _submission_receipt(self, result, digest, size, job_type):
         job_id = result.get("job_id") if isinstance(result, dict) else None
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise ToolFailure("invalid_response", "NetConverter returned no job id")
-        out = {"job_id": job_id, "status": _status(result.get("status")), "sha256": digest, "bytes": len(content)}
-        self._log("submit_file", path=relative, job_type=job_type, source_vendor=source_vendor,
-                  target_vendor=target_vendor, **out)
+        out = {"job_id": job_id, "status": _status(result.get("status")), "sha256": digest, "bytes": size}
         if job_type == "prescan":  # a fixed text of ours, never the server's free text
             out.update(job_type="prescan", next_steps=PRESCAN_NEXT_STEPS, guided_tools=self._guided_tools_state())
         return out
@@ -688,25 +867,27 @@ class Bridge:
         finally:
             client.close()
 
-    def _submit_external(self, content, source_vendor, target_vendor, job_type, options, key):
+    def _submit_external(self, content, source_vendor, target_vendor, job_type, options, key, *, policy=None,
+                         uploaded=None, save_upload=None, legacy_vendors=None):
         client = self._client(ExternalClient)
         try:
             return submit_external(client, content, source_vendor, target_vendor, job_type, options, key,
-                                   allow_document=False)
+                                   allow_document=False, policy=policy, uploaded=uploaded, save_upload=save_upload,
+                                   legacy_vendors=legacy_vendors)
         except UnicodeDecodeError:
             raise ToolFailure("invalid_path", "Select a UTF-8 text configuration") from None
         finally:
             client.close()
 
-    def _job_summary(self, job_id) -> dict:
+    def _job_summary(self, job_id, *, source_submission: bool = False) -> dict:
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise ToolFailure("invalid_arguments", "job_id must be a NetConverter job id")
-        kind, _ = self.profile()
+        kind, _ = self.profile(source_submission=source_submission)
         client = self._client(Client if kind == "quick" else ExternalClient)
         try:
             data = client.status(job_id) if kind == "quick" else client.job(job_id)
         except APIError as exc:
-            raise _api_failure(exc) from None
+            raise (_submission_api_failure(exc) if source_submission else _api_failure(exc)) from None
         finally:
             client.close()
         if not isinstance(data, dict):
@@ -717,6 +898,20 @@ class Bridge:
             out["verdict"] = _status(verdict)
         if isinstance(data.get("review_required"), bool):
             out["review_required"] = data["review_required"]
+        # #2295: lifecycle and producer verdict remain unchanged. The server's
+        # effective disposition may hold a completed job for omitted metadata.
+        # Only fixed names/booleans cross this boundary, never its notice prose.
+        if "job_status" in data:
+            out["job_status"] = _status(data["job_status"]) if isinstance(data["job_status"], str) else "unknown"
+        for field in ("metadata_complete", "reasons_truncated"):
+            if isinstance(data.get(field), bool):
+                out[field] = data[field]
+        omitted = data.get("metadata_omitted_fields")
+        if isinstance(omitted, list):
+            out["metadata_omitted_fields"] = list(dict.fromkeys(
+                field for field in omitted if isinstance(field, str) and field in _features.METADATA_FIELDS))
+        if out.get("metadata_complete") is False or out.get("metadata_omitted_fields"):
+            out["metadata_notice"] = _features.METADATA_NOTICE
         progress = data.get("progress")
         if isinstance(progress, dict):  # {"stage": ..., "percentage": ...}
             progress = progress.get("percentage")
@@ -849,8 +1044,28 @@ class Bridge:
         return out
 
     def download(self, job_id=None, dest_dir=".", *, draft_id=None, revision=None,
-                 artifact_id=None, manifest_revision=None, diagram=None):
+                 artifact_id=None, manifest_revision=None, diagram=None,
+                 export_kind=None, expected_document_sha256=None, artifact_kind=None, export_id=None):
+        if artifact_kind is not None or export_id is not None:
+            if (artifact_kind != "evidence-workbook"
+                    or (export_id is not None and (not isinstance(export_id, str) or not re.fullmatch(r"exp_[a-f0-9]{32}", export_id)))
+                    or any(value is not None for value in (diagram, export_kind, revision, expected_document_sha256, draft_id, artifact_id, manifest_revision))):
+                raise ToolFailure("invalid_arguments", "Workbook resume requires artifact_kind=evidence-workbook and an optional exact export_id; do not combine artifact requests")
+        outcome = None
+        if export_kind is not None:
+            try:
+                document_export_query(export_kind, revision, expected_document_sha256)
+            except (TypeError, ValueError) as exc:
+                raise ToolFailure("invalid_arguments", str(exc)) from None
+            if any(value is not None for value in (draft_id, artifact_id, manifest_revision, diagram)):
+                raise ToolFailure("invalid_arguments", "Document exports cannot be combined with diagram or draft artifact requests")
+        elif expected_document_sha256 is not None:
+            raise ToolFailure("invalid_arguments", "A decision hash requires export_kind='decision-yaml'")
         if self.guided:
+            if artifact_kind is not None:
+                raise ToolFailure("unsupported_capability", "Resumable workbook exports require the standard full API bridge")
+            if export_kind is not None:
+                return mcp_workflows.error("unsupported_capability", "Use the standard full API bridge for explicit job document exports")
             if diagram is not None:
                 return mcp_workflows.error("unsupported_capability", "Use a selected completed job for diagram downloads")
             if dest_dir != ".":
@@ -859,7 +1074,7 @@ class Bridge:
             if job_id is not None or artifact_id is not None or manifest_revision is not None:
                 args.update(job_id=job_id, artifact_id=artifact_id, manifest_revision=manifest_revision)
             return self._guided_download(args)
-        if any(value is not None for value in (draft_id, revision, artifact_id, manifest_revision)):
+        if any(value is not None for value in (draft_id, artifact_id, manifest_revision)) or (revision is not None and export_kind is None):
             raise ToolFailure("invalid_arguments", "Draft download requires guided mode")
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise ToolFailure("invalid_arguments", "job_id must be a NetConverter job id")
@@ -869,8 +1084,25 @@ class Bridge:
         except WorkspaceError as exc:
             raise ToolFailure("invalid_path", str(exc)) from None
         kind, _ = self.profile()
+        if artifact_kind is not None and kind != "external":
+            raise ToolFailure("unsupported_capability", "Resumable workbook exports require the full External API")
         try:
-            if diagram is not None:
+            if export_kind is not None:
+                if kind != "external":
+                    raise ToolFailure("unsupported_capability", "Explicit document exports require the full External API")
+                client = self._client(ExternalClient)
+                try:
+                    content, meta = client.document_export(job_id, export_kind, revision=revision,
+                        expected_document_sha256=expected_document_sha256)
+                    label = (f"decisions-r{meta['revision']}" if "revision" in meta else "decisions-effective")
+                    if export_kind == "source-ncir":
+                        filename = f"source-{meta['sha256'][:16]}.ncir"
+                    else:
+                        filename = f"{label}-{meta['sha256'][:16]}.yaml"
+                    paths = [output.save_artifact(job_id, filename, content, meta["sha256"])]
+                finally:
+                    client.close()
+            elif diagram is not None:
                 if kind != "external":
                     raise ToolFailure("unsupported_capability", "Diagram requests require the full External API; Quick bundles retain their existing artifacts")
                 client = self._client(ExternalClient)
@@ -887,22 +1119,31 @@ class Bridge:
                 finally:
                     client.close()
             else:
-                paths = self._download_external(job_id, output)
+                outcome = self._download_external(job_id, output, export_id=export_id, workbook_only=artifact_kind is not None)
+                paths = outcome.paths
         except APIError as exc:
             raise _api_failure(exc) from None
         except WorkspaceError as exc:
             raise ToolFailure("download_refused", str(exc)) from None
         files = []
-        for path in paths:
-            data = Path(path).read_bytes()
-            files.append({
-                "name": str(Path(path).relative_to(self.workspace.root)),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "bytes": len(data),
-            })
+        try:
+            for path in paths:
+                files.append({"name": str(Path(path).relative_to(self.workspace.root)),
+                              **output.artifact_receipt(path)})
+        except (WorkspaceError, ValueError):
+            raise ToolFailure("download_refused", "A verified artifact publication receipt is unavailable") from None
         self._log("download", job_id=job_id, files=len(files),
                   path=str(target.relative_to(self.workspace.root)) or ".")
-        return {"job_id": job_id, "files": files}
+        result = {"job_id": job_id, "files": files}
+        if outcome is not None:
+            result["complete"] = outcome.complete
+            if outcome.pending_export is not None:
+                result["pending_export"] = outcome.pending_export
+            if outcome.export_reference is not None:
+                result["export_reference"] = outcome.export_reference
+            if outcome.failure is not None:
+                result["failure"] = outcome.failure
+        return result
 
     def preview_diagram(self, job_id, diagram):
         exposure = self.exposure
@@ -956,10 +1197,10 @@ class Bridge:
             raise WorkspaceError("Destination is not a folder")
         return resolved
 
-    def _download_external(self, job_id: str, output: Workspace) -> list:
+    def _download_external(self, job_id: str, output: Workspace, *, export_id=None, workbook_only=False):
         client = self._client(ExternalClient)
         try:
-            return download_external(client, job_id, output)
+            return download_external_resumable(client, job_id, output, export_id=export_id, workbook_only=workbook_only)
         finally:
             client.close()
 
@@ -967,17 +1208,20 @@ class Bridge:
         """Which guided-migration tools this session lists, and why any are missing (aws#1090)."""
         exposure = self.exposure
         out = {"exposure_level": exposure.level, "tools": []}
-        if exposure.strict:
-            out.update(hidden_by_level=True, fix=(
-                f"Exposure level {exposure.level} serves the server's strict view, which lists no "
-                "guided-migration tools. In a terminal in this folder run `netconverter privacy level full`, "
-                "then reconnect the AI client's netconverter server so it reads tools/list again."))
-            return out
         if self.remote is None:
             out["note"] = "remote tools are off for this bridge (--no-remote, or no credential at start)"
             return out
         self.list_tools()
-        out["tools"] = sorted(n for n in self._remote_names.values() if n in GUIDED_TOOLS)
+        disclosed = set(GUIDED_TOOLS) | MAPPING_TOOLS
+        out["tools"] = sorted(n for n in self._remote_names.values() if n in disclosed)
+        if exposure.strict:
+            out.update(hidden_by_level=True, fix=(
+                f"Exposure level {exposure.level} restricts guided editing tools. "
+                "The tools listed here are available for this account, including mapping tools when advertised. "
+                "If broader evidence is needed, the human can run `netconverter privacy level full` "
+                "in this folder and reconnect the AI client's netconverter server. "
+                "Changing exposure does not grant server write permission."))
+            return out
         missing = [n for n in GUIDED_TOOLS if n not in out["tools"]]
         if missing:
             out["note"] = (f"not listed by the server for this account: {', '.join(missing)}. "
@@ -1138,6 +1382,7 @@ class Bridge:
             return mcp_workflows.tools_for(self._guided_request("capabilities", {}))
         tools = [json.loads(json.dumps(tool)) for tool in LOCAL_TOOLS]
         self._remote_names = {}
+        self._prescan_receipts = False
         if self.remote is None:
             return tools
         allowlist = self.remote_allowlist
@@ -1147,6 +1392,7 @@ class Bridge:
         except RemoteError as exc:
             print(f"netconverter mcp: remote read tools unavailable ({exc.code})", file=sys.stderr)
             return tools
+        receipt_schema = False
         for tool in remote_tools:
             name = tool["name"]
             if not remote_allowed(name, allowlist):
@@ -1156,6 +1402,11 @@ class Bridge:
                 continue
             self._remote_names[local_name] = name
             tool = {**tool, "name": local_name}
+            if name == "submit_conversion":
+                schema = tool.get("inputSchema")
+                properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                receipt_schema = isinstance(properties, dict) and {
+                    "draft_id", "approval_ref", "idempotency_key"} <= set(properties)
             if name in CONFIRM_REMOTE and isinstance(tool.get("inputSchema"), dict):
                 schema = json.loads(json.dumps(tool["inputSchema"]))
                 properties = schema.setdefault("properties", {})
@@ -1163,9 +1414,34 @@ class Bridge:
                     properties.setdefault("confirm_token", CONFIRM_TOKEN_SCHEMA)
                     tool["inputSchema"] = schema
             tools.append(tool)
+        self._prescan_receipts = receipt_schema and {
+            "request_submission_review", "get_submission_approval", "submit_conversion"
+        } <= set(self._remote_names.values())
         if self.strict:
             self.server_view()  # learn (and say once) whether the server applies the strict view
         return tools
+
+    def _uses_prescan_receipt(self, arguments: dict) -> bool:
+        """Negotiate receipt transport; only the server verifies human authority.
+
+        Never downgrade receipt-shaped requests to the legacy confirmation path:
+        an old server could otherwise ignore the receipt and queue a plain job.
+        """
+        if not {"draft_id", "approval_ref", "idempotency_key"} & set(arguments):
+            return False
+        if not self._prescan_receipts:
+            raise ToolFailure("server_upgrade_required", "This server does not offer exact-revision approval receipts")
+        patterns = {"draft_id": r"draft_[a-f0-9]{32}",
+                    "approval_ref": r"approval_[a-f0-9]{32}",
+                    "idempotency_key": r"[A-Za-z0-9_-]{8,128}",
+                    "job_id": r"[A-Za-z0-9_-]{1,80}"}
+        if (any(not isinstance(arguments.get(key), str) or
+                re.fullmatch(pattern, arguments[key]) is None for key, pattern in patterns.items())
+                or type(arguments.get("revision")) is not int
+                or not 0 <= arguments["revision"] <= 10000
+                or "confirm_token" in arguments):
+            raise ToolFailure("invalid_arguments", "Provide the exact job revision, draft_id, approval_ref and stable idempotency_key; do not combine a receipt with a local confirm_token")
+        return True
 
     def call(self, name: str, arguments: dict) -> dict:
         try:
@@ -1195,6 +1471,12 @@ class Bridge:
             self.list_tools()
         remote_name = self._remote_names.get(name)
         exposure = self.exposure
+        if (remote_name is None and self.remote is not None and name in SERVER_ADDED_TOOLS
+                and remote_allowed(name, self.remote_allowlist)):
+            return _error_result(
+                "server_upgrade_required",
+                f"'{name}' needs a newer NetConverter server; this server does not offer it yet. "
+                "Use get_job_brief and get_evidence for the job's review reasons meanwhile.")
         if remote_name is None or self.remote is None or not remote_allowed(remote_name, self.remote_allowlist):
             return _error_result("unknown_tool", f"Unknown tool '{name}'; call tools/list")
         if remote_name in MAPPING_TOOLS and exposure.level == "none":
@@ -1202,7 +1484,11 @@ class Bridge:
                 "level_none", "Guided mapping needs this folder at the masked level or higher: questions name "
                 "zones and interfaces as tokens, and `none` returns summaries only. Raise it in a terminal with "
                 "`netconverter privacy level masked`, then retry.")
-        if remote_name in CONFIRM_REMOTE:
+        try:
+            receipt_submission = remote_name == "submit_conversion" and self._uses_prescan_receipt(arguments)
+        except ToolFailure as exc:
+            return _error_result(exc.code, str(exc), **exc.extra)
+        if remote_name in CONFIRM_REMOTE and not receipt_submission:
             arguments = dict(arguments)
             token = arguments.pop("confirm_token", None)
             answers = arguments.get("answers")

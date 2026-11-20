@@ -3,12 +3,38 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 import uuid
 from urllib.parse import urlsplit
 
 import httpx
 
 DEFAULT_BASE = "https://api.netconverter.ai/external/v1"
+MAX_DOCUMENT_EXPORT_BYTES = 100 * 1024 * 1024
+MAX_WORKBOOK_EXPORT_BYTES = 50 * 1024 * 1024
+WORKBOOK_FAILURE_CODES = frozenset({"export_failed", "export_stale", "export_size_limit",
+    "export_deadline", "export_queue_expired", "export_renderer_mismatch",
+    "evidence_unavailable", "evidence_integrity_failed", "export_render_failed"})
+WORKBOOK_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_WORKBOOK_EXPORT_ID = re.compile(r"exp_[a-f0-9]{32}\Z")
+
+
+def document_export_query(kind, revision=None, expected_document_sha256=None):
+    """Fixed file export parameters; no arbitrary URL, path, or document body."""
+    if kind not in {"decision-yaml", "source-ncir"}:
+        raise ValueError("Unsupported document export")
+    if kind == "source-ncir" and (revision is not None or expected_document_sha256 is not None):
+        raise ValueError("NCIR exports do not accept decision revision parameters")
+    params = {}
+    if revision is not None:
+        if type(revision) is not int or not 0 <= revision <= 10000:
+            raise ValueError("Invalid decision revision")
+        params["revision"] = revision
+    if expected_document_sha256 is not None:
+        if not isinstance(expected_document_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_document_sha256):
+            raise ValueError("Invalid decision hash")
+        params["expected_document_sha256"] = expected_document_sha256
+    return params
 
 
 def _printable(value, limit: int = 300) -> str:
@@ -225,7 +251,7 @@ class ExternalClient(Client):
     """
 
     _ALLOWED = re.compile(
-        r"(?:me|capabilities|jobs|jobs/[A-Za-z0-9_-]{1,80}(?:/translated|/report|/evidence\.xlsx|/findings\.sarif|/diagrams/render|/validation/(?:ncir|receipt|txt|pdf|xlsx))?)\Z"
+        r"(?:me|capabilities|files/upload|jobs|jobs/[A-Za-z0-9_-]{1,80}(?:/translated|/report|/evidence\.xlsx|/findings\.sarif|/diagrams/render|/validation/(?:ncir|receipt|txt|pdf|xlsx)|/exports/(?:decision-yaml|source-ncir|evidence\.xlsx(?:/exp_[a-f0-9]{32}(?:/content)?)?))?)\Z"
     )
 
     def me(self):
@@ -234,6 +260,11 @@ class ExternalClient(Client):
     def capabilities(self):
         """Vendors, source→target paths, job types and limits POST /jobs accepts."""
         return self.request("GET", "capabilities")
+
+    def upload_file(self, content: bytes, filename: str = "configuration.cfg"):
+        """Authenticated multipart transport; no configuration bytes enter a model tool."""
+        return self.request("POST", "files/upload", data={"folder": "uploads", "purpose": "file"},
+                            files={"file": (filename, content, "application/octet-stream")})
 
     def jobs(self, limit: int = 25):
         data = self.request("GET", "jobs", params={"comparable": "false", "limit": limit})
@@ -249,6 +280,124 @@ class ExternalClient(Client):
         if response.is_error:
             raise self._error(response, request_id)
         return response.content
+
+    @staticmethod
+    def _workbook_metadata(data, job_id, export_id=None):
+        """Allowlisted, job-bound metadata; never return server URLs or prose."""
+        if (not isinstance(data, dict) or data.get("job_id") != job_id
+                or not isinstance(data.get("export_id"), str)
+                or not _WORKBOOK_EXPORT_ID.fullmatch(data["export_id"])
+                or (export_id is not None and data["export_id"] != export_id)
+                or data.get("state") not in {"queued", "processing", "ready", "failed", "stale"}
+                or type(data.get("retry_after_seconds")) is not int
+                or not 0 <= data["retry_after_seconds"] <= 3600):
+            raise APIError(502, "invalid_export_metadata")
+        result = {key: data[key] for key in ("export_id", "job_id", "state", "retry_after_seconds")}
+        if data["state"] == "ready":
+            size, digest = data.get("bytes"), data.get("content_sha256")
+            if (type(size) is not int or not 0 < size <= MAX_WORKBOOK_EXPORT_BYTES
+                    or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+                raise APIError(502, "invalid_export_metadata")
+            result.update(bytes=size, content_sha256=digest)
+        # Failure prose is intentionally not passed through this metadata surface.
+        if data["state"] in {"failed", "stale"}:
+            code = data.get("failure_code")
+            result["failure_code"] = code if code in WORKBOOK_FAILURE_CODES else "export_" + data["state"]
+        return result
+
+    @contextmanager
+    def _workbook_stream(self, method, path, request_id):
+        # Disable HTTPX's automatic auth retry: it drains a rejected response
+        # before retrying, outside our body limits. Close a 401 unread instead.
+        for attempt in range(2):
+            headers = {"X-Request-ID": request_id, "Accept-Encoding": "identity",
+                       "Authorization": f"Bearer {self.credential.token()}"}
+            with self.http.stream(method, path, auth=None, headers=headers) as response:
+                if response.headers.get("Content-Encoding", "identity").strip().lower() != "identity":
+                    raise APIError(502, "invalid_export_encoding", request_id)
+                if response.status_code == 401 and attempt == 0 and self.credential.refresh():
+                    continue
+                yield response
+                return
+
+    def workbook_export(self, job_id: str, export_id: str | None = None) -> dict:
+        """Prepare once or inspect an exact export; never poll or fall back implicitly."""
+        job_id = self.identifier(job_id)
+        path = f"jobs/{job_id}/exports/evidence.xlsx"
+        if export_id is not None:
+            if not isinstance(export_id, str) or not _WORKBOOK_EXPORT_ID.fullmatch(export_id):
+                raise ValueError("Invalid workbook export identifier")
+            path += "/" + export_id
+        import json
+        request_id = "req_" + uuid.uuid4().hex
+        try:
+            with self._workbook_stream("GET" if export_id is not None else "POST", path, request_id) as response:
+                if response.status_code == 404:
+                    raise APIError(404, "export_unavailable", request_id)
+                if response.status_code not in (200, 202):
+                    raise APIError(response.status_code, "export_request_failed", request_id)
+                if (response.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json"
+                        or response.headers.get("Content-Encoding", "identity") != "identity"):
+                    raise APIError(502, "invalid_export_metadata", request_id)
+                body = bytearray()
+                for chunk in response.iter_bytes(chunk_size=8192):
+                    if len(body) + len(chunk) > 16384:
+                        raise APIError(502, "invalid_export_metadata", request_id)
+                    body.extend(chunk)
+                try:
+                    data = json.loads(body)
+                    if not isinstance(data, dict) or data.get("success") is not True:
+                        raise ValueError
+                    return self._workbook_metadata(data["data"], job_id, export_id)
+                except (ValueError, KeyError, TypeError, RecursionError):
+                    raise APIError(502, "invalid_export_metadata", request_id) from None
+        except httpx.HTTPError:
+            raise APIError(0, "connection_failed", request_id) from None
+
+    def workbook_export_content(self, job_id: str, metadata: dict) -> tuple[bytes, str]:
+        """Bounded authenticated transfer; status and content identities must agree."""
+        import hashlib
+        import json
+        job_id = self.identifier(job_id)
+        meta = self._workbook_metadata(metadata, job_id)
+        if meta["state"] != "ready":
+            raise APIError(409, "export_not_ready")
+        path = f"jobs/{job_id}/exports/evidence.xlsx/{meta['export_id']}/content"
+        request_id = "req_" + uuid.uuid4().hex
+        try:
+            with self._workbook_stream("GET", path, request_id) as response:
+                if response.status_code != 200:
+                    body = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        if len(body) + len(chunk) > 8192:
+                            break
+                        body.extend(chunk)
+                    code = "export_unavailable" if response.status_code == 404 else "request_failed"
+                    try:
+                        data = json.loads(body)
+                        detail = data.get("detail", data.get("error", {}))
+                        if isinstance(detail, dict) and isinstance(detail.get("code"), str) and detail["code"] in {
+                                "export_not_ready", "export_failed", "export_stale"}:
+                            code = detail["code"]
+                    except (ValueError, AttributeError, RecursionError):
+                        pass
+                    raise APIError(response.status_code, code, request_id)
+                size = response.headers.get("Content-Length", "")
+                if (response.headers.get("Content-Type", "").split(";", 1)[0].strip() != WORKBOOK_MIME
+                        or response.headers.get("Content-Encoding", "identity") != "identity"
+                        or response.headers.get("X-Content-SHA256") != meta["content_sha256"]
+                        or not size.isdecimal() or len(size) > 12 or int(size) != meta["bytes"]):
+                    raise APIError(502, "invalid_export_content", request_id)
+                content = bytearray()
+                for chunk in response.iter_bytes(chunk_size=65536):
+                    if len(content) + len(chunk) > meta["bytes"]:
+                        raise APIError(502, "artifact_size_mismatch", request_id)
+                    content.extend(chunk)
+                if len(content) != meta["bytes"] or hashlib.sha256(content).hexdigest() != meta["content_sha256"]:
+                    raise APIError(502, "artifact_checksum_mismatch", request_id)
+                return bytes(content), meta["content_sha256"]
+        except httpx.HTTPError:
+            raise APIError(0, "connection_failed", request_id) from None
 
     def validation_artifact(self, job_id: str, format: str) -> tuple[bytes, str] | None:
         """Recorded source artifacts; the server hash is verified before any write.
@@ -270,6 +419,87 @@ class ExternalClient(Client):
         if not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(response.content).hexdigest() != expected:
             raise APIError(502, "artifact_checksum_mismatch", request_id)
         return response.content, expected
+
+    def document_export(self, job_id, kind, *, revision=None, expected_document_sha256=None,
+                        max_bytes=MAX_DOCUMENT_EXPORT_BYTES):
+        """Stream one explicit document directly to the file-transport caller.
+
+        Error bodies are bounded and only their safe code is retained. Hash,
+        provenance and revision checks precede every filesystem write.
+        """
+        import hashlib
+        params = document_export_query(kind, revision, expected_document_sha256)
+        if type(max_bytes) is not int or not 0 < max_bytes <= MAX_DOCUMENT_EXPORT_BYTES:
+            raise ValueError("Invalid export byte limit")
+        path = f"jobs/{self.identifier(job_id)}/exports/{kind}"
+        request_id = "req_" + uuid.uuid4().hex
+        try:
+            for attempt in range(2):
+                # HTTPX drains a 401 body before automatic auth retries, outside
+                # our limits. Refresh here only after a bounded response read.
+                headers = {"X-Request-ID": request_id, "Accept-Encoding": "identity",
+                           "Authorization": f"Bearer {self.credential.token()}"}
+                with self.http.stream("GET", path, params=params, auth=None, headers=headers) as response:
+                    if 300 <= response.status_code < 400:
+                        raise APIError(response.status_code, "artifact_redirect_refused", request_id)
+                    if response.headers.get("Content-Encoding", "").strip().lower() not in {"", "identity"}:
+                        raise APIError(502 if response.status_code == 200 else response.status_code,
+                                       "unsupported_export_encoding", request_id)
+                    content = bytearray()
+                    limit = max_bytes if response.status_code == 200 else 8192
+                    length = response.headers.get("Content-Length")
+                    if length and (not length.isdecimal() or len(length) > 12 or int(length) > limit):
+                        raise APIError(413 if response.status_code == 200 else response.status_code,
+                                       "artifact_too_large" if response.status_code == 200 else "request_failed", request_id)
+                    for chunk in response.iter_bytes(chunk_size=min(64 * 1024, limit + 1)):
+                        if len(content) + len(chunk) > limit:
+                            raise APIError(413 if response.status_code == 200 else response.status_code,
+                                           "artifact_too_large" if response.status_code == 200 else "request_failed", request_id)
+                        content.extend(chunk)
+                    if response.status_code == 401 and attempt == 0 and self.credential.refresh():
+                        continue
+                    if response.status_code != 200:
+                        import json
+                        code = "request_failed"
+                        try:
+                            body = json.loads(content)
+                            detail = body.get("detail", body.get("error", {})) if isinstance(body, dict) else {}
+                            value = detail.get("code") if isinstance(detail, dict) else None
+                            if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,79}", value):
+                                code = value
+                        except (ValueError, TypeError, RecursionError):
+                            pass
+                        raise APIError(response.status_code, code, request_id)
+                    expected = response.headers.get("X-Content-SHA256", "")
+                    if not re.fullmatch(r"[a-f0-9]{64}", expected) or hashlib.sha256(content).hexdigest() != expected:
+                        raise APIError(502, "artifact_checksum_mismatch", request_id)
+                    provenance = response.headers.get("X-Export-Provenance")
+                    media = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                    meta = {"sha256": expected, "provenance": provenance}
+                    if kind == "source-ncir":
+                        original = response.headers.get("X-Artifact-SHA256", "")
+                        if (provenance != "source-stage-2.5" or media != "application/json"
+                                or not re.fullmatch(r"[a-f0-9]{64}", original)):
+                            raise APIError(502, "invalid_export_provenance", request_id)
+                        meta["artifact_sha256"] = original
+                    else:
+                        doc_hash = response.headers.get("X-Document-SHA256", "")
+                        number = response.headers.get("X-Document-Revision")
+                        if (provenance not in {"prescan-revision", "conversion-effective"}
+                                or media != "application/yaml" or not re.fullmatch(r"[a-f0-9]{64}", doc_hash)
+                                or (expected_document_sha256 is not None and doc_hash != expected_document_sha256)):
+                            raise APIError(502, "invalid_export_provenance", request_id)
+                        if provenance == "prescan-revision":
+                            if (number is None or not re.fullmatch(r"[0-9]{1,5}", number)
+                                    or int(number) > 10000 or (revision is not None and int(number) != revision)):
+                                raise APIError(502, "export_revision_mismatch", request_id)
+                            meta["revision"] = int(number)
+                        elif revision is not None or number is not None:
+                            raise APIError(502, "export_revision_mismatch", request_id)
+                        meta["document_sha256"] = doc_hash
+                    return bytes(content), meta
+        except httpx.HTTPError:
+            raise APIError(0, "connection_failed", request_id) from None
 
     def findings(self, job_id: str):
         """Every finding of a completed validate/optimize job (SARIF 2.1.0 JSON)."""

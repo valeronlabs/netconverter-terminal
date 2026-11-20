@@ -16,7 +16,7 @@ Your AI assistant ── file path ──> netconverter mcp (on this machine) �
 With the full API, choosing a file only pins it by SHA-256; the file is sent when
 you choose **Submit** (a pilot key uploads at selection, after its own confirmation).
 
-Selecting a file uploads its full contents directly to NetConverter. This is a
+Submitting a file uploads its full contents directly to NetConverter. This is a
 hosted conversion service, not an offline engine. Raw configurations, generated
 configurations, reports, object identifiers, and addresses are excluded from the
 client's automatic model requests. Unknown words in natural-language input become
@@ -35,9 +35,12 @@ The terminal neither bundles nor downloads model weights.
 
 The bridge offers its local tools (`submit_file`, `job_status`, `wait_for_job`,
 `account`, `download`) and proxies NetConverter's remote tools only from a fixed
-client-side allowlist of read tools. A tool the server adds later is not offered
-until a client release lists it, and a remote tool named `submit_*` is never
-proxied.
+client-side allowlist. This includes read tools and supported guided actions,
+subject to the server's capabilities and the workspace exposure level. A tool
+the server adds later is not offered until a client release lists it. The
+exact-revision `submit_conversion` flow requires negotiated receipt support and
+a server-verified human approval; a tool name or local confirmation is not that
+approval. See [prescan approval](PRESCAN_APPROVAL.md).
 
 ### Exposure levels
 
@@ -58,10 +61,21 @@ You choose how much of a job's results an assistant sees, per workspace folder
 - **full**: the results as the server serves them for your account (0.4.x `--full`).
 
 At **every** level the bridge strips secrets client-side: values of keys such as `psk`,
-`password`, `community`, `*_hash`, configuration syntax such as `pre-shared-key X`,
+`password`, `password_hash`, `community`, `api_key`, `access_token` and `refresh_token`,
+configuration syntax such as `pre-shared-key X`,
 `snmp-server community X`, `password 7 X`, `secret 5 X`, and crypt/`ENC`/`-AQ==` hashes become
 `<secret>`. This is defence in depth over the server's own view; it is pattern-based and does not
 replace the server's handling.
+Credential field matching handles case, whitespace, hyphen and underscore
+variations, including `apiKey`. A credential object or list retains the secrecy
+of its parent field. Existing configuration and hash patterns also apply to
+mapping keys; redacted keys receive distinct suffixes when needed so entries
+are not merged or overwritten.
+Numeric values under exact credential field names are also redacted; booleans
+and numeric metadata such as `api_key_count` and `password_length` remain visible.
+Data beyond the filter's nesting limit is explicitly withheld, never returned
+without filtering. Approval references, idempotency keys, page cursors and
+artifact hashes remain usable workflow identifiers.
 
 The bridge sends the level as `X-NetConverter-View` on every remote request; the server applies
 min(your grant, the level), so a session can only lower what the tenant's grant allows, and
@@ -154,6 +168,35 @@ since 0.1.x so saved credentials survive the rename to NetConverter CLI).
 Server accounts are scoped to the server URL; model accounts are provider names.
 Credentials are never written into `.netconverter/`.
 
+### Concurrent sign-in updates
+
+Login, refresh and logout coordinate through issuer/client/store-scoped OS locks.
+Refresh and logout compare the saved generation before replacing or removing it;
+a newer login wins. Running sessions observe replacement generations and invalidate
+their cached MCP session, view and profile. OAuth HTTP runs outside these credential
+transactions. Interactive encrypted-store passphrases are requested before acquiring
+the account locks or starting the deadline worker. Token values remain in the
+credential store or process memory.
+
+OS-keyring locks are empty owner-only files under `~/.netconverter-credential-locks/`,
+independent of the chosen application config directory. Encrypted-store account
+locks sit beside the configured encrypted file; a separate whole-file lock protects
+updates to different accounts. Locks use POSIX flock or native held handles on local
+Windows NTFS and fail closed when secure locking is unavailable. Lock files are not
+deleted after use, so waiting processes continue to name the same lock.
+
+A keyring deadline can return before the OS operation finishes. Its worker retains
+the lock until the operation actually completes; later updates cannot pass it.
+An incomplete stored token pair is refused instead of being used. Unlock the store
+and retry if an operation is busy or unavailable. When upgrading, restart all running
+terminal/MCP processes: older clients do not participate in these transactions.
+Native Windows execution is a required qualification gate, separate from POSIX tests.
+Running sessions remain bound to the physical store from which their sign-in was
+loaded. They do not silently switch to an older fallback login after logout or a
+store outage. Logout removes the compared sign-in, preserving credentials in other
+stores. To intentionally change stores, configure the desired store and start a
+new session; a new `auto` session retains the OS-store-first read order below.
+
 ### Encrypted credential file (headless machines)
 
 An SSH host, a container or a server without a desktop session usually has no OS
@@ -220,7 +263,7 @@ byte count, job id, vendors, status) so the app can show `/activity`. It never
 records configuration text, tool results or credentials, and keeps the newest 500 lines.
 
 `netconverter update` and the daily update check contact only the public GitHub
-API for `valeronlabs/netconverter_terminals` (and GitHub's release download hosts),
+API for `valeronlabs/netconverter-terminal` (and GitHub's release download hosts),
 with no NetConverter credential. The request carries a `netconverter-cli/<version>`
 User-Agent. The check stores the latest version and check times in
 `update-check.json` in your user cache folder (`~/Library/Caches/netconverter` on
@@ -244,7 +287,8 @@ forbidden operations, workspace escape attempts, output preservation, and
 interrupted sessions. Every request is tenant-scoped by the credential. A 0.1.x
 Terminal Quick key reaches only its restricted pilot profile; full-API keys and
 Clerk sign-ins reach the External API (`/jobs`, `/capabilities`) and, for questions,
-the read-only NetConverter MCP tools. Full-fidelity server AI stays opt-in per tenant.
+the allowlisted NetConverter MCP tools, subject to account and exposure gates.
+Full-fidelity server AI stays opt-in per tenant.
 
 **The complete audit of backend AI-provider payloads remains open.** Client tests
 and clean diagnostic-log checks do not establish that every downstream server

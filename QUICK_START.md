@@ -10,7 +10,12 @@ curl -LsSf https://netconverter.ai/install.sh | sh
 ```
 
 This installs uv and `netconverter-cli` from PyPI, signs you in, creates
-`~/migrations` and offers to connect each AI assistant it finds (steps 2 and 6 below).
+`~/migrations` by default and offers to connect each AI assistant it finds (steps 2 and 6 below).
+That folder name is optional. To select your existing project folder during installation:
+
+```sh
+curl -LsSf https://netconverter.ai/install.sh | sh -s -- --workspace "$HOME/Projects/Acme Firewall"
+```
 Add `--no-connect` (`… | sh -s -- --no-connect`) to only install and sign in.
 
 By hand:
@@ -23,7 +28,7 @@ netconverter --version
 ```
 
 Without PyPI access, download `netconverter_cli-<version>-py3-none-any.whl` and
-`SHA256SUMS` from the [latest release](https://github.com/valeronlabs/netconverter_terminals/releases/latest),
+`SHA256SUMS` from the [latest release](https://github.com/valeronlabs/netconverter-terminal/releases/latest),
 run `shasum -a 256 -c SHA256SUMS` (stop if it fails), then
 `uv tool install --python 3.12 ./netconverter_cli-<version>-py3-none-any.whl`.
 
@@ -49,12 +54,49 @@ ASA → Palo Alto scope.
 ## 3. Run the app in your config folder
 
 ```sh
-mkdir -p ~/NetConverter-Demo && cd ~/NetConverter-Demo
-cp /path/to/examples/demo-asa.cfg .
+cd "/absolute/path/to/your/customer folder"
 netconverter
+
+# Or select that folder without changing your shell directory:
+netconverter --workspace "/absolute/path/to/your/customer folder" run
 ```
 
-The folder you start in is the workspace. Nothing is uploaded when the app opens.
+Use an existing folder you own; replace the example path with yours. No folder named
+`migrations` is required. `run` opens the full-screen app, just like `netconverter`
+without a subcommand. Nothing is uploaded when the app opens. `/ls`, `/pwd` and
+`/cd` list files, show the app folder and change it. Local state lives in that
+folder's `.netconverter/`. Interactive app/CLI downloads go beside a recorded
+source, or to the workspace root when no local source is recorded. MCP `download`
+defaults to the workspace root; its `dest_dir` can select an in-workspace folder.
+
+### Choose how you want to work
+
+| Mode | Start | Local file access |
+| --- | --- | --- |
+| Terminal by itself | `netconverter` or plain CLI commands | You choose a file and submit directly to NetConverter |
+| Local MCP bridge | Configure your assistant with `netconverter --workspace "/absolute/project folder" connect cursor` | The assistant starts a stdio bridge confined to that configured folder |
+| Hosted MCP | Connect ChatGPT or another remote MCP client to NetConverter | No access to your local disk; upload through Terminal/API first and use the returned source/job ID |
+
+The bridge command is `netconverter mcp --workspace "/absolute/project folder"`.
+It is normally launched by the assistant, not typed into an interactive chat.
+The full-screen Terminal does not need to remain open for that separate process.
+Opening Terminal alone does not connect a hosted assistant to your files.
+
+Check and deliberately choose this folder's assistant exposure:
+
+```sh
+netconverter --workspace "/absolute/project folder" privacy status
+netconverter --workspace "/absolute/project folder" privacy level full
+```
+
+Raising exposure requires your terminal confirmation. Full means permitted results
+for that folder and account; it does not mean whole-computer access or grant server
+write permissions. Full exposure does not authorize uploading every file; select
+and authorize each intended transfer or explicitly scoped batch. The configured bridge keeps its absolute folder even if you
+later `cd` in a shell. Run `connect` for the new intended folder and reconnect the
+assistant to change it. Keep each customer workspace separate. In 0.8.0, automatic
+MCP file listing is POSIX-only and needs full exposure; Windows can still submit
+an explicitly known, authorized path. Check the running bridge's actual version.
 
 | Key | Does |
 | --- | --- |

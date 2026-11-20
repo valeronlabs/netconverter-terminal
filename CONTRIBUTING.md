@@ -4,8 +4,8 @@ This repository contains the independently packaged Python terminal client.
 Server implementation and credentials do not belong here.
 
 ```sh
-git clone https://github.com/valeronlabs/netconverter_terminals.git
-cd netconverter_terminals
+git clone https://github.com/valeronlabs/netconverter-terminal.git
+cd netconverter-terminal
 uv sync --frozen --group dev
 uv run pytest tests -q
 uv run python -m build --wheel

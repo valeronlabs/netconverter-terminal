@@ -134,7 +134,10 @@ def test_root_swapped_to_symlink_at_publication_cannot_redirect_output(tmp_path,
     with pytest.raises(WorkspaceError):
         publish(workspace)
     assert not list(outside.iterdir())
-    assert not list(moved.iterdir())
+    # Publication failed after linking the final name. It is retained because
+    # pathname cleanup cannot atomically exclude a later customer replacement.
+    assert [path.name for path in moved.iterdir()] == ["draft_1.revision-1.yaml"]
+    assert (moved / "draft_1.revision-1.yaml").read_bytes() == b"synthetic: true\n"
 
 
 def test_destination_swapped_to_fifo_during_open_is_bounded(workspace, monkeypatch):
