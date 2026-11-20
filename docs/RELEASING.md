@@ -69,6 +69,20 @@ trusted-publisher binding to use the current public repository name.
    and that the GitHub Release has `netconverter_cli-<version>-py3-none-any.whl` and
    `SHA256SUMS`.
 
+6. Reconcile the public website in `devnexthop/aws-netconverter.ai`. Create or link
+   a website tracking issue/PR in the release handoff, including the published
+   version, release URL and date. Follow
+   `scripts/website-chrome/README.md` → Terminal release reconciliation:
+   - update `terminal-release.json`, install/upgrade instructions and release notes;
+   - update troubleshooting, compatibility evidence and the product updates page;
+   - copy installer changes, regenerate docs/search and check links/sitemap;
+   - publish through the engine repository's production coordinator;
+   - verify the live install, compatibility, troubleshooting and updates pages,
+     then record the deployed website commit/URLs on the issue and project board.
+   Package publication and website verification are separate statuses. Keep the
+   website follow-up open until live proof exists; do not imply untested platforms
+   or workflows became qualified because the version changed.
+
 A version already on PyPI cannot be uploaded again. If the PyPI job fails after the
 upload (rare), re-run only the `github-release` job; to fix a bad release, publish the
 next patch version.

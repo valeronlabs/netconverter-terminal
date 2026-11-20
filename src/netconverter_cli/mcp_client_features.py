@@ -207,12 +207,14 @@ _TEXT = {
         "For other supported job types submit with submit_file "
         "(the user may be asked to confirm the upload), then follow the job with wait_for_job, calling it "
         "again while timed_out is true. Report the verdict (ready, needs review or blocked), the reason "
-        "counts and the next step; use the read tools for findings. Offer download for the artifacts; "
+        "counts and the next step; for why a job needs review call why_needs_review when it is listed, "
+        "and use the read tools for findings. Offer download for the artifacts; "
         "they are saved to the workspace for the engineer to open. "
     ),
     "mapping-review": (
         "Review the mapping decisions of a NetConverter job{job}. Use job_status, then the read tools "
-        "available (get_job_brief, get_evidence, get_report and, when listed, the interface, zone, NAT, "
+        "available (get_job_brief, get_evidence, get_report and, when listed, why_needs_review and the "
+        "interface, zone, NAT, "
         "route and policy summaries) to summarise what was mapped, what needs review and what is blocked, "
         "and which decisions the engineer still has to make. Do not infer a mapping the results do not "
         "show; say what is missing instead. "

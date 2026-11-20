@@ -279,14 +279,16 @@ configuration text). Default: `compare_against_intent`, `fetch`, `get_account`,
 `get_unused_objects`, `get_vpn_summary`, `get_zone_summary`, `kb_explain`,
 `kb_search`, `list_jobs`, `list_objects_with_attribute`, `list_rules_matching`,
 `query_ir`, `search`, `select_job`, `simulate_flow`, `vendor_capability_lookup`,
-`get_mapping_questions`, `validate_mapping`, `apply_mapping_answers`, `list_operations`,
+`why_needs_review`, `get_mapping_questions`, `validate_mapping`, `apply_mapping_answers`, `list_operations`,
 `get_decision_document`, `validate_decision_document`, `propose_operations`, `submit_conversion`,
 `set_view_level` (lowers the server's view for the session; it can never raise it).
 At levels `none`, `masked` and `selected` (the default is masked; `full` uses the default list):
 `list_jobs`, `select_job`, `get_account`, `search`, `fetch`,
 `kb_search`, `kb_explain`, `vendor_capability_lookup`, `get_job_brief`,
-`get_evidence`, `get_report`, the three guided-mapping tools, plus the chosen sections' tools under `selected`. A listed tool appears
-only if the server offers it.
+`get_evidence`, `get_report`, `why_needs_review`, the three guided-mapping tools, plus the chosen sections' tools under `selected`. A listed tool appears
+only if the server offers it. `why_needs_review` (aws#1494: the ranked readiness checks that hold a job,
+each with a count, up to five items, the remediation and the evidence section) needs a server that offers
+it; on an older server a call returns `server_upgrade_required` ("needs a newer NetConverter server").
 The bridge sends the level on every request (`X-NetConverter-View: none|masked|selected|full`;
 the server may only lower the grant's view, never raise it) and reads the view in force from
 `get_account`. Until the server applies it, the bridge enforces strict locally: it refuses
