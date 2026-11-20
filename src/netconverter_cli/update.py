@@ -29,7 +29,7 @@ import httpx
 
 from . import __version__
 
-REPO = "valeronlabs/netconverter_terminals"
+REPO = "valeronlabs/netconverter-terminal"
 DIST = "netconverter-cli"
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"

@@ -67,7 +67,7 @@ mkdir -p ~/migrations                                           # Windows: mkdir
 netconverter --workspace ~/migrations connect --all
 ```
 Without PyPI access, install the wheel from the
-[latest release](https://github.com/valeronlabs/netconverter_terminals/releases/latest) after
+[latest release](https://github.com/valeronlabs/netconverter-terminal/releases/latest) after
 checking it against `SHA256SUMS`: `uv tool install --python 3.12 ./netconverter_cli-<version>-py3-none-any.whl`.
 
 ## If something does not work

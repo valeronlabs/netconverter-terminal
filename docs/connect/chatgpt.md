@@ -1,63 +1,96 @@
-# ChatGPT
+# ChatGPT and local MCP connections
 
-ChatGPT reaches NetConverter in two ways:
+Choose the connection by where the file lives. A hosted NetConverter connection
+reaches NetConverter's server; a local Terminal MCP connection reaches the folder
+selected on your computer. Running Terminal alone does not connect a Mac folder
+to an existing hosted chat.
 
-- **ChatGPT desktop app's agent (Codex)**, on your computer: it runs this terminal's bridge, so
-  it can **upload configuration files** by path and run a **guided migration** (prescan →
-  decisions → conversion). Setup below under *Upload files from ChatGPT*.
-- **The hosted connector** (chatgpt.com, any ChatGPT app): reads your jobs, results, account
-  and the knowledge base; it cannot submit configurations. Setup under *Add the connector*.
+| Connection | File access | Guided migration |
+|---|---|---|
+| Local Terminal bridge in a compatible desktop/CLI client | Selected local workspace; direct upload by path | `submit_file(job_type="prescan")` starts the prescan automatically |
+| NetConverter hosted MCP | Server-side files/jobs exposed by its live tool catalog | Continue an available prescan; starting from a stored file requires the server's file-selection/prescan tools |
 
-`netconverter connect chatgpt` prints both.
+Discover the actual tools in the conversation. Do not assume a hosted connection
+has local `submit_file` or `list_workspace_files`, and do not identify a stored
+file by filename alone when names can repeat. A missing starting tool is a
+capability gap; the assistant must explain it rather than claim it uploaded a file.
 
-## Upload files from ChatGPT (desktop app agent)
+## Connect a local workspace
 
-The ChatGPT desktop app's agent reads its MCP servers from `~/.codex/config.toml`, the same
-file Codex CLI uses. Use a dedicated folder for your configurations (not your home folder):
+Use a dedicated migration folder and explicitly configure the client to launch
+Terminal's stdio bridge for it:
 
 ```sh
-netconverter login --clerk                          # once; or an enterprise API key with write:jobs
+netconverter login --clerk
 mkdir -p ~/migrations && cd ~/migrations
-netconverter connect codex                          # adds [mcp_servers.netconverter] for this folder
-netconverter privacy level full                     # needed for the guided-migration tools; type the phrase
+netconverter connect codex
+netconverter privacy level full
 ```
 
-Then restart ChatGPT. If `~/.codex/config.toml` already has `[mcp_servers.netconverter]`,
-`connect` shows the table instead of changing it: edit its `args` to
-`["mcp", "--workspace", "/Users/<you>/migrations"]`.
+`connect codex` shows the proposed change to `~/.codex/config.toml` and preserves
+other configuration. If the NetConverter table already exists, follow the shown
+instructions to change its workspace without adding a duplicate connection.
+Reconnect the local client's MCP session after installation or configuration changes.
+Verify that `submit_file` appears before asking it to upload.
 
-What happens in a chat (*"Prescan ~/migrations/edge.cfg from ASA to Palo Alto XML and walk me
-through the decisions"*):
+OpenAI documents shared MCP configuration for Codex CLI, its IDE extension and
+compatible ChatGPT desktop execution. That does not make a hosted connector a
+local bridge. See [OpenAI's MCP configuration documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+NetConverter's actual acceptance results for each client remain separate from
+those configuration capabilities.
 
-1. ChatGPT asks to run `submit_file`: approve it in ChatGPT's own tool prompt.
-2. ChatGPT cannot show the bridge's upload form (it declines it unseen), so the bridge sends
-   nothing and answers `confirmation_required`. ChatGPT asks you in the chat whether to upload
-   that file (path and size); only when you say yes does it repeat the call with the
-   single-use `confirm_token`. The file goes from disk to NetConverter; its text never passes
-   through ChatGPT. The job stops at a `psc_` prescan.
-3. ChatGPT reads the decisions (`list_operations`, `get_decision_document`,
-   `validate_decision_document`), asks you about each one, records your choices with
-   `propose_operations`, and with your OK queues the conversion with `submit_conversion`
-   (asked in the chat the same way). `download` saves the Palo Alto output in the folder.
+## Select, prescan, decide and convert
 
-Exposure level: the guided-migration tools need `full` for the folder. At `masked` (the default)
-the prescan still runs, and `account` says the tools are hidden and how to fix it. The write tools
-(`propose_operations`, `submit_conversion`) are listed only where they are enabled for your
-tenant. If you prefer ChatGPT's own tool approval as the only confirmation, add
-`"--no-upload-confirm"` to the `args` (or set `NETCONVERTER_MCP_UPLOAD_CONFIRM=0`).
-ChatGPT keeps the tool list from when it started: restart it after an update or a level change.
+Example: **“List the files in this migration folder. Use HQ-ASA-01.txt for Cisco
+ASA to Palo Alto SET and guide me through the migration.”**
 
-## Add the connector
+1. `list_workspace_files` returns relative paths, sizes and types, not file bodies.
+   Filenames can contain sensitive names or addresses, so listing requires the
+   human-selected `full` exposure level. At lower levels, supply a known path.
+   It is nonrecursive, defaults to 50 entries per page (maximum 100), and returns
+   a continuation cursor. Select a returned directory to inspect that subfolder.
+   Cursors expire after five minutes or a relevant metadata change. Hidden paths,
+   client state, unsafe links, special files and names that would be redacted are
+   excluded, with an exclusion count. Paths are limited to 1,024 UTF-8 bytes;
+   oversized entries are excluded and oversized folder requests are refused.
+   The structured page is bounded to 16 KiB and may contain fewer than the
+   requested entries. A folder with more
+   than 10,000 entries is refused; select a smaller subfolder or a known file path.
+   This private candidate supports discovery on POSIX only. Windows users can
+   still supply a known relative path to the existing submission tool.
+2. The assistant establishes the exact source, target/output format and device
+   identity, then calls `submit_file` with `job_type="prescan"` for the selected
+   file. Terminal handles authorized upload and prescan directly; no preliminary
+   Quick Convert or Conversion Studio step is required. Names and listing metadata
+   are untrusted data, not instructions or proof of format support.
+3. After `wait_for_job` reports the prescan complete, inspect the available
+   operations and bounded decision sections. Discuss choices, record them on the
+   server with `propose_operations`, and validate the resulting exact revision.
+4. Review the intended changes and warnings. When the server offers exact-revision
+   approval tools, request its review and obtain the approved receipt before
+   `submit_conversion`. The receipt removes the duplicate bridge queue prompt;
+   pending review is not approval. Older servers use the existing confirmation
+   path. Client tool approvals can still apply.
+5. Follow the new job, inspect evidence and download verified artifacts. Full YAML
+   or NCIR exports are explicit file downloads, not routine conversation payloads.
 
-1. In ChatGPT: **Settings → Apps & Connectors → Advanced settings** → turn on
-   **Developer mode**, then **Create** a custom connector.
-2. Fill it in:
-   - **Name:** `NetConverter`
-   - **MCP server URL:** `https://api.netconverter.ai/mcp/v1`
-   - **Authentication:** OAuth. Under the advanced OAuth settings enter
-     **Client ID** `RjSv1z2Gms6iS96s` and leave the client secret empty.
-3. Save, then sign in with your NetConverter account when asked.
-4. In a chat, enable NetConverter from the **+** menu (Developer mode).
+The folder's exposure setting and tenant grants still govern guided operations.
+Do not disable a confirmation to bypass a declined upload or an unapproved
+revision. Repeated prompts for an already authorized action are distinct from
+reviewing the final migration revision.
 
-Developer mode and custom connectors depend on your ChatGPT plan and workspace
-settings; on business workspaces an admin may need to allow them.
+## Connect hosted ChatGPT
+
+`netconverter connect chatgpt` prints the hosted setup instructions. Use
+`https://api.netconverter.ai/mcp/v1` with the authentication and OAuth client ID
+provided by your NetConverter administrator, then enable it in your conversation.
+Your ChatGPT workspace must allow the connection. See
+[OpenAI's connection instructions](https://developers.openai.com/plugins/deploy/connect-chatgpt)
+for current client setup.
+
+For ChatGPT access to a private local MCP server, OpenAI also documents
+[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+It requires a separately configured tunnel, runtime credentials and organization/
+workspace permissions. It is a candidate integration route, not an automatically
+installed or verified NetConverter feature. No public listener or custom remote
+shell is required by this guide.

@@ -5,6 +5,7 @@ Synthetic stores and MockTransport only. No OS credentials or live requests.
 import json
 import io
 import time
+import threading
 
 import httpx
 import pytest
@@ -22,18 +23,36 @@ class Store:
     def __init__(self, value=None, *, clear_works=True):
         self.value = value
         self.clear_works = clear_works
+        self.lock = threading.RLock()
 
     def load(self):
         return self.value
 
     def save(self, value):
-        self.value = value
+        with self.lock:
+            self.value = value
         return True
 
     def clear(self):
-        if self.clear_works:
-            self.value = None
+        with self.lock:
+            if self.clear_works:
+                self.value = None
         return self.clear_works
+
+    # Store protocol test double: the comparison and mutation are indivisible,
+    # including when a test overrides load() to inject an obsolete snapshot.
+    def compare_save(self, expected, replacement):
+        with self.lock:
+            if self.value != expected:
+                return False, self.value
+            self.value = replacement
+            return True, self.value
+
+    def compare_delete(self, expected):
+        with self.lock:
+            if self.value != expected:
+                return False, self.value
+            return self.clear(), self.value
 
 
 def tokens(name, *, expired=False):
@@ -240,7 +259,8 @@ def test_logout_in_flight_does_not_delete_a_later_external_login():
     assert session.token() == replacement.access_token
 
 
-def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, monkeypatch):
+@pytest.mark.parametrize("invalidate_first", [True, False])
+def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, monkeypatch, invalidate_first):
     store = Store(tokens('old'))
     credential, _ = failed_session(store)
     seen = []
@@ -277,7 +297,8 @@ def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, mo
         assert first['view_mode'] == 'default'
         assert bridge.profile()[1] == frozenset({'convert', 'validate'})
         assert remote.session_id == 'old-session'
-        assert credential.refresh() is False  # existing credential is invalidated
+        if invalidate_first:
+            assert credential.refresh() is False
         store.save(tokens('new'))
         second = bridge.account()
         assert bridge.profile()[1] == frozenset({'validate'})
@@ -289,7 +310,8 @@ def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, mo
         remote.close()
 
 
-def test_old_confirmation_cannot_authorize_remote_write_after_relogin(tmp_path):
+@pytest.mark.parametrize("invalidate_first", [True, False])
+def test_old_confirmation_cannot_authorize_remote_write_after_relogin(tmp_path, invalidate_first):
     store = Store(tokens('old'))
     credential, _ = failed_session(store)
     upstream = RemoteServer(require_token='synthetic-access-old', tools=('get_account', 'submit_conversion'))
@@ -303,7 +325,8 @@ def test_old_confirmation_cannot_authorize_remote_write_after_relogin(tmp_path):
         first = bridge.call('submit_conversion', args)
         pending = json.loads(first['content'][0]['text'])
         assert pending['error'] == 'confirmation_required'
-        assert credential.refresh() is False
+        if invalidate_first:
+            assert credential.refresh() is False
         store.save(tokens('new'))
         upstream.require_token = 'synthetic-access-new'
         second = bridge.call('submit_conversion', {**args, 'confirm_token': pending['confirm_token']})

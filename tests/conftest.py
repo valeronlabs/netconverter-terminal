@@ -18,6 +18,9 @@ def _no_real_sign_in(request, monkeypatch):
                  "NETCONVERTER_CREDENTIAL_PASSPHRASE", "NETCONVERTER_CREDENTIAL_PASSPHRASE_FILE"):
         monkeypatch.delenv(name, raising=False)
     from netconverter_cli import credential_file
+    from netconverter_cli import credential_lock
+    lock_root = request.getfixturevalue("tmp_path_factory").mktemp("nc-credential-locks")
+    monkeypatch.setattr(credential_lock, "lock_root", lambda: lock_root)
 
     monkeypatch.setattr(credential_file, "can_prompt", lambda: False)
     credential_file.forget_keys()

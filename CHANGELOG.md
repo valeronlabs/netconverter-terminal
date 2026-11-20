@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.0 — 2026-11-20
+
+- Report the guided mapping tools actually advertised in masked sessions instead of claiming that none exist. Preserve strict filtering and tenant write permissions (#73).
+- Explain credential-store recovery for the running operating system; macOS guidance no longer prescribes Linux D-Bus settings. No credential access or privacy policy changes.
+- Document arbitrary customer folders and the distinct interactive Terminal, local stdio bridge and hosted MCP workflows.
+
+- Prepare evidence workbooks through bounded resumable exports. Full API conversion downloads preserve verified primary-file receipts when a workbook is pending or fails, and resume only the named workbook. Verify its server hash, type and size (maximum 50 MiB); never fall back to an expensive synchronous export or replace existing files. Requires matching server support. Installed macOS stdio qualification verified configuration/report downloads and resumable workbook completion.
+
+- Discover local configuration paths with the metadata-only `list_workspace_files` MCP tool on POSIX at the human-selected full exposure level. Pages stay within the selected workspace, exclude hidden state and unsafe links, and refuse stale or changing listings. Windows enumeration remains unavailable; known-path submission is unchanged. Clarify hosted versus local ChatGPT/Codex connections.
+- Explain typed account-storage quota refusals with safe byte counts and storage-management guidance. Unknown server errors remain scrubbed; no automatic retry or file removal occurs. Requires the matching server error contract; live qualification remains pending.
+- Negotiate configurable direct-file upload limits and upload file references without sending source content through the assistant. Scoped manager ZIP bundles remain standard conversion-only; guided bundles are not supported yet.
+- Preserve ambiguous submissions in a confined journal; retry only the identical request through the server idempotency contract.
+- Forward an exact server-approved guided submission receipt without a second bridge queue prompt. Initial upload authorization and human server review remain separate.
+- Download explicitly requested YAML/NCIR as verified files; keep bodies out of model responses and preserve existing output files during races and failures.
+- Confine source snapshots and artifact writes on POSIX and Windows; reject private state, unsafe links and changing source paths.
+- Extend secret filtering to nested credential values and mapping keys while retaining opaque workflow identifiers.
+- Serialize login/refresh/logout updates across processes and preserve newer login generations. Restart older terminal/MCP processes after upgrading; they do not participate in the new credential transaction protocol.
+- Use the canonical public download repository `valeronlabs/netconverter-terminal`.
+- Qualified with installed macOS stdio transport, saved live artifact receipts, Linux client CI and Windows boundary CI. Native Windows end-to-end and every hosted assistant workflow remain separate acceptance scopes; this release does not claim device or traffic validation.
+
+## Unreleased
+
+- Proxy the hosted `why_needs_review` tool (devnexthop/aws-netconverter.ai#1494): the ranked
+  readiness checks that hold a job, each with a count, up to five scrubbed items, the remediation
+  and the evidence section. Listed at every exposure level (strict view, like `get_evidence`) when
+  the server offers it; on an older server a call says it needs a newer NetConverter server
+  (`server_upgrade_required`) instead of `unknown_tool`.
+
 ## 0.7.3 — 2026-11-03
 
 - Recover an expired Clerk sign-in in the running MCP bridge after a separate `netconverter login --clerk`, without restarting the assistant.

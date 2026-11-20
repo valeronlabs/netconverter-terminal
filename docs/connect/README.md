@@ -44,7 +44,7 @@ netconverter connect --all          # connect every assistant found on this comp
 ```
 
 Manual install: `uv tool install --python 3.12 netconverter-cli` ([uv](https://docs.astral.sh/uv)),
-or the wheel from the [latest release](https://github.com/valeronlabs/netconverter_terminals/releases/latest)
+or the wheel from the [latest release](https://github.com/valeronlabs/netconverter-terminal/releases/latest)
 — see [getting access](getting-access.md).
 
 ## Check that it works

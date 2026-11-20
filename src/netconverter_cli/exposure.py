@@ -283,7 +283,8 @@ def audit_entries(root, limit: int = 20) -> list[dict]:
 SECRET = "<secret>"
 _SECRET_KEY_WORDS = ("password", "passwd", "passphrase", "secret", "psk", "preshared", "pre_shared",
                      "community", "private_key", "auth_key", "authentication_key", "key_string",
-                     "md5_key", "shared_key")
+                     "md5_key", "shared_key", "api_key", "access_token", "refresh_token", "bearer_token")
+_SECRET_KEY_COMPACT = tuple(word.replace("_", "") for word in _SECRET_KEY_WORDS)
 _SECRET_WORDS = (r"pre-shared-key|preshared-key|pre_shared_key|key-string|authentication-key|auth-key|"
                  r"md5-key|passphrase|password|passwd|community|secret|psk")
 _KEYWORD_VALUE = re.compile(
@@ -301,11 +302,11 @@ _FORTINET_ENC = re.compile(r"\b(ENC)\s+[A-Za-z0-9+/=]{8,}")
 _PANOS_ENC = re.compile(r"-AQ==[A-Za-z0-9+/=]+")
 
 
-def _secret_key(key) -> bool:
+def _secret_key(key, *, exact: bool = False) -> bool:
     if not isinstance(key, str):
         return False
-    norm = key.lower().replace("-", "_")
-    return any(word in norm for word in _SECRET_KEY_WORDS)
+    norm = re.sub(r"[-_\s]", "", key.casefold())
+    return norm in _SECRET_KEY_COMPACT if exact else any(word in norm for word in _SECRET_KEY_COMPACT)
 
 
 def _strip_text(text: str) -> str:
@@ -324,19 +325,37 @@ def _strip_text(text: str) -> str:
 def strip_secrets(value, depth: int = 0):
     """Secret values out of any JSON-like value: by key name and by configuration syntax."""
     if depth > 40:
-        return value
+        return "[nested data withheld at depth limit]"
     if isinstance(value, str):
         return _strip_text(value)
     if isinstance(value, list):
         return [strip_secrets(v, depth + 1) for v in value]
     if isinstance(value, dict):
         out = {}
+        key_counts = {}
         for key, item in value.items():
-            if _secret_key(key) and (isinstance(item, str) and item or
-                                     isinstance(item, list) and any(isinstance(i, str) for i in item)):
-                out[key] = SECRET if isinstance(item, str) else [SECRET for _ in item]
+            safe_key = _strip_text(key) if isinstance(key, str) else key
+            if safe_key != key:
+                # A neutral marker must not become a new credential field on
+                # a second pass (e.g. a crypt hash used as a mapping key).
+                safe_key = safe_key.replace(SECRET, "[redacted]")
+            if safe_key != key:
+                # Known configuration syntax can appear as a map key too.
+                # Never merge distinct entries or overwrite an existing key.
+                base = safe_key
+                number = key_counts.get(base, 0)
+                while safe_key in value or safe_key in out:
+                    number += 1
+                    safe_key = f"{base} [redacted key {number}]"
+                key_counts[base] = number
+            if ((type(item) in (int, float) and _secret_key(key, exact=True))
+                    or (_secret_key(key) and item and isinstance(item, (str, list, dict)))):
+                # A structured value must retain the secrecy of its parent key.
+                # Exact numeric credentials are secrets too; booleans and
+                # numeric metadata such as password_length remain useful.
+                out[safe_key] = [SECRET for _ in item] if isinstance(item, list) else SECRET
             else:
-                out[key] = strip_secrets(item, depth + 1)
+                out[safe_key] = strip_secrets(item, depth + 1)
         return out
     return value
 

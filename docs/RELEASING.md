@@ -1,7 +1,7 @@
 # Releasing the NetConverter CLI
 
 A release is a `v<version>` tag on the public repository
-`valeronlabs/netconverter_terminals`. The [Release workflow](../.github/workflows/release.yml)
+`valeronlabs/netconverter-terminal`. The [Release workflow](../.github/workflows/release.yml)
 then tests and builds the package, publishes it to PyPI as
 [`netconverter-cli`](https://pypi.org/project/netconverter-cli/) with trusted publishing
 (no API token anywhere), and only then creates the GitHub Release with the wheel and
@@ -13,25 +13,28 @@ carry the same file without publishing anything.
 
 ## One-time setup (founder)
 
-Do these once, before the first tag. Nothing can be published until they exist.
+Verify these settings before the next approved tag. The public repository is
+`valeronlabs/netconverter-terminal`; the private authoring repository remains
+`devnexthop/netconverter_terminals`. A repository rename also requires the PyPI
+trusted-publisher binding to use the current public repository name.
 
 1. **PyPI account.** Sign in to <https://pypi.org> with the ValeronLabs account (create it
    if needed) and turn on two-factor authentication (required for publishing).
-2. **Pending trusted publisher** (this also reserves the name; `netconverter-cli` is free
-   on PyPI today). PyPI → *Your account* → **Publishing** →
-   *Add a new pending publisher* → **GitHub**:
+2. **Existing project trusted publisher.** `netconverter-cli` is already published.
+   PyPI → *Your projects* → **netconverter-cli** → **Publishing**. Verify or
+   update the GitHub trusted-publisher binding for the existing project:
 
    | Field | Value |
    |---|---|
    | PyPI Project Name | `netconverter-cli` |
    | Owner | `valeronlabs` |
-   | Repository name | `netconverter_terminals` |
+   | Repository name | `netconverter-terminal` |
    | Workflow name | `release.yml` |
    | Environment name | `pypi` |
 
    The project is created on the first successful publish; the pending publisher then
    becomes a normal trusted publisher of that project.
-3. **GitHub environment.** <https://github.com/valeronlabs/netconverter_terminals> →
+3. **GitHub environment.** <https://github.com/valeronlabs/netconverter-terminal> →
    *Settings* → *Environments* → **New environment** → `pypi`. Recommended:
    *Required reviewers* = the founder (each publish waits for approval) and
    *Deployment branches and tags* → *Selected* → tag rule `v*`.
@@ -65,6 +68,20 @@ Do these once, before the first tag. Nothing can be published until they exist.
    ```
    and that the GitHub Release has `netconverter_cli-<version>-py3-none-any.whl` and
    `SHA256SUMS`.
+
+6. Reconcile the public website in `devnexthop/aws-netconverter.ai`. Create or link
+   a website tracking issue/PR in the release handoff, including the published
+   version, release URL and date. Follow
+   `scripts/website-chrome/README.md` → Terminal release reconciliation:
+   - update `terminal-release.json`, install/upgrade instructions and release notes;
+   - update troubleshooting, compatibility evidence and the product updates page;
+   - copy installer changes, regenerate docs/search and check links/sitemap;
+   - publish through the engine repository's production coordinator;
+   - verify the live install, compatibility, troubleshooting and updates pages,
+     then record the deployed website commit/URLs on the issue and project board.
+   Package publication and website verification are separate statuses. Keep the
+   website follow-up open until live proof exists; do not imply untested platforms
+   or workflows became qualified because the version changed.
 
 A version already on PyPI cannot be uploaded again. If the PyPI job fails after the
 upload (rare), re-run only the `github-release` job; to fix a bad release, publish the

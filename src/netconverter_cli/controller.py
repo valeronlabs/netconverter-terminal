@@ -10,9 +10,10 @@ from pathlib import Path
 
 from .workspace import Workspace, WorkspaceError
 from .api import APIError, Client, ExternalClient
-from .backend import EXTERNAL_MAX_BYTES, download_external, submit_external
+from .backend import EXTERNAL_MAX_BYTES, download_external_resumable, submit_external
 from .catalog import Catalog
 from .job_options import check as check_options
+from .submission_journal import credential_scope, definitive_refusal, ensure_retry_timestamp
 
 # Query commands → the NetConverter MCP tool of the same purpose (full API profile).
 QUERY_TOOLS = {
@@ -148,7 +149,7 @@ class Controller:
 
     def _select_local(self, filename, vendor):
         """Full API: nothing is uploaded until submit; the revision is pinned by SHA-256."""
-        path, _, digest = self.workspace.snapshot(filename, self.max_bytes())
+        path, _, digest = self.workspace.snapshot(filename, self.max_bytes(), allow_archives=True)
         handle = "local_" + digest[:16]
         self.state["configurations"][handle] = {
             "path": str(path.relative_to(self.workspace.root)),
@@ -163,7 +164,8 @@ class Controller:
 
     def _selected_revision(self, handle):
         metadata = self.state["configurations"].get(handle) or {}
-        _, content, digest = self.workspace.snapshot(metadata.get("path", ""), self.max_bytes())
+        _, content, digest = self.workspace.snapshot(metadata.get("path", ""), self.max_bytes(),
+                                                      allow_archives=self.external)
         if digest != metadata.get("sha256"):
             raise WorkspaceError("The selected file changed after you chose it; select it again")
         return metadata, content
@@ -184,26 +186,44 @@ class Controller:
             "operation": operation,
             "options": options or {},
         }
+        if self.external:
+            request["transport_scope"] = hashlib.sha256(json.dumps([
+                str(self.client.http.base_url).rstrip("/"), credential_scope(self.client.credential),
+            ], separators=(",", ":")).encode()).hexdigest()
         pending = self.state.get("pending")
         if pending and pending["request"] != request:
             raise WorkspaceError(
-                "An interrupted submission is pending; use resume before submitting different work"
+                "An interrupted submission is pending; resume its original work, account and server "
+                "or reconcile it before changing scope"
             )
+        if pending and self.external:
+            ensure_retry_timestamp(pending.get("started"))
+        if self.external:
+            # Pin source bytes before creating a new durable pending request.
+            # A local read failure cannot have queued a job; an existing
+            # ambiguous submission still retains its original receipt/key.
+            metadata, content = self._selected_revision(selected)
         key = pending["key"] if pending else uuid.uuid4().hex
-        self.state["pending"] = {"key": key, "request": request, "started": time.time()}
+        self.state["pending"] = pending or {"key": key, "request": request, "started": time.time()}
         self.workspace.store(self.state)
         try:
             if self.external:
-                metadata, content = self._selected_revision(selected)
                 settings = dict(options or {})
                 target = settings.pop("target_vendor", None)
+                def save_upload(receipt):
+                    ensure_retry_timestamp(self.state["pending"]["started"])
+                    self.state["pending"]["uploaded"] = receipt
+                    self.workspace.store(self.state)
                 result = submit_external(self.client, content, metadata["vendor"], target,
-                                         operation, settings, key)
+                                         operation, settings, key,
+                                         uploaded=self.state["pending"].get("uploaded"), save_upload=save_upload)
             else:
                 wire = "analyze" if operation == "validate" else operation  # the pilot API's name
                 result = self.client.submit(selected, wire, options or {}, key)
         except APIError as exc:
-            if exc.status in {400, 403, 404, 413, 422, 429}:
+            clear_pending = (not pending and definitive_refusal(exc)) if self.external else (
+                exc.status in {400, 403, 404, 413, 422, 429})
+            if clear_pending:
                 self.state.pop("pending", None)
                 self.workspace.store(self.state)
             raise
@@ -346,11 +366,22 @@ class Controller:
             else self.workspace.root
         )
         parent = self.workspace._inside(parent)
+        outcome = None
         if self.external:
-            paths = download_external(self.client, job, Workspace(parent))
+            outcome = download_external_resumable(self.client, job, Workspace(parent))
+            paths = outcome.paths
         else:
             paths = fetch_artifacts(self.client, job, Workspace(parent))
-        return {"job_id": job, "saved": [str(path) for path in paths]}
+        result = {"job_id": job, "saved": [str(path) for path in paths]}
+        if outcome is not None:
+            result["complete"] = outcome.complete
+            if outcome.pending_export is not None:
+                result["pending_export"] = outcome.pending_export
+            if outcome.export_reference is not None:
+                result["export_reference"] = outcome.export_reference
+            if outcome.failure is not None:
+                result["failure"] = outcome.failure
+        return result
 
     def target(self):
         job = self.state.get("active_job")

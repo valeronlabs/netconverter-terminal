@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from .api import Client, DEFAULT_BASE, APIError
 from .backend import detect_profile, open_client
-from .credentials import (KeyringLocked, get_secret, keyring_available, keyring_problem, load_secret,
+from .credentials import (KeyringLocked, credential_access_hint, get_secret, keyring_available, keyring_problem, load_secret,
                           save_secret, store_label)
 from .controller import Controller
 from .providers import Provider, ProviderError
@@ -206,11 +206,14 @@ def mcp_auth_default() -> str:
 
 
 def choose_mcp_credential(auth: str, server: str, mcp_url: str):
-    """A locked keyring starts the bridge without a credential and says why (#10)."""
+    """An unavailable sign-in starts the bridge without switching principals."""
     try:
         return _choose_mcp_credential(auth, server, mcp_url)
     except KeyringLocked:
         return None, None, "none", [f"credential: none; {KEYRING_LOCKED}"]
+    except ClerkError:
+        return None, None, "none", ["credential: none; could not read your NetConverter sign-in; "
+                                    "unlock the credential store or sign in again"]
 
 
 def _choose_mcp_credential(auth: str, server: str, mcp_url: str):
@@ -253,9 +256,7 @@ def _choose_mcp_credential(auth: str, server: str, mcp_url: str):
         return rest_session, remote_session, "clerk_session", notes
     problem = keyring_problem()
     if problem:  # an AI client started us without the desktop keyring (#17): say so, not "sign in"
-        notes.append(f"credential: none; {problem}. Start this MCP server with "
-                     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus in its environment, "
-                     "or set NETCONVERTER_API_KEY there.")
+        notes.append(f"credential: none; {problem}. " + credential_access_hint())
     else:
         notes.append("credential: none (run `netconverter login --clerk`, or store an API key with `netconverter login`)")
     return None, None, "none", notes
@@ -349,10 +350,10 @@ VENDOR_REQUIRED = "--vendor is required: the source vendor code of the file."
 def check_submission(args) -> dict:
     """Local checks for a one-shot submit, before any sign-in or network call (#9).
 
-    Returns the parsed --options. The size limit is the full API's ceiling here;
-    the profile's own limit is applied again when the file is selected.
+    Returns the parsed --options. Apply the local safety ceiling before sign-in;
+    the server's negotiated policy is applied again when the file is selected.
     """
-    from .backend import EXTERNAL_MAX_BYTES
+    from .upload_policy import CLIENT_MAX_FILE_BYTES
 
     try:
         options = json.loads(args.options)
@@ -367,7 +368,10 @@ def check_submission(args) -> dict:
             raise WorkspaceError(f"File not found: {args.file} (looked in {workspace.root})")
         if path.is_file() and path.stat().st_size == 0:
             raise WorkspaceError(f"{args.file} is empty; choose the saved configuration file")
-        workspace.snapshot(args.file, EXTERNAL_MAX_BYTES)
+        # Conversion may negotiate opaque ZIP transport after sign-in. The
+        # selected profile and server policy still gate the actual submission.
+        workspace.snapshot(args.file, CLIENT_MAX_FILE_BYTES,
+                           allow_archives=args.command == "convert")
     except WorkspaceError as exc:
         raise CommandError(str(exc), EXIT_INPUT) from None
     return options
@@ -689,6 +693,9 @@ def main(argv=None):
         raise  # a SystemExit whose code is the exit status; str() keeps the message
     except KeyringLocked:
         _stderr(KEYRING_LOCKED)
+        raise SystemExit(EXIT_AUTH) from None
+    except ClerkError as exc:
+        _stderr(str(exc) or SIGNED_OUT)
         raise SystemExit(EXIT_AUTH) from None
     except (KeyboardInterrupt, EOFError):
         print(CANCELLED, file=sys.stderr)

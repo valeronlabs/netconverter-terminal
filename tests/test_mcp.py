@@ -21,14 +21,15 @@ def test_local_tool_annotations_describe_mutation_and_network():
     from netconverter_cli.mcp_server import LOCAL_TOOLS
 
     tools = {tool["name"]: tool["annotations"] for tool in LOCAL_TOOLS}
-    assert set(tools) == {"submit_file", "job_status", "wait_for_job", "account", "download", "preview_diagram"}
+    assert set(tools) == {"list_workspace_files", "submit_file", "job_status", "wait_for_job", "account", "download", "preview_diagram"}
     for name in ("submit_file", "download"):
         assert tools[name]["readOnlyHint"] is False
         assert tools[name]["idempotentHint"] is False
-    for name in ("job_status", "wait_for_job", "account", "preview_diagram"):
+    for name in ("list_workspace_files", "job_status", "wait_for_job", "account", "preview_diagram"):
         assert tools[name]["readOnlyHint"] is True
         assert tools[name]["idempotentHint"] is True
-    assert all(value["openWorldHint"] is True for value in tools.values())
+    assert tools["list_workspace_files"]["openWorldHint"] is False
+    assert all(value["openWorldHint"] is True for name, value in tools.items() if name != "list_workspace_files")
 
 from netconverter_cli.api import StaticCredential
 from netconverter_cli.mcp_server import Bridge, StdioServer
@@ -101,6 +102,14 @@ class ExternalServer:
             return httpx.Response(200, text=f"set address {MARKER} ip-netmask 192.0.2.10/32\n")
         if path.endswith("/report"):
             return envelope({"job_id": "x", "translation_report": {"note": MARKER}})
+        if "/exports/evidence.xlsx" in path:
+            content = b"PK\x03\x04synthetic-workbook"
+            digest = hashlib.sha256(content).hexdigest()
+            if path.endswith("/content"):
+                return httpx.Response(200, content=content, headers={"X-Content-SHA256": digest,
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+            return envelope({"job_id": path.split("/")[1], "export_id": "exp_" + "b" * 32,
+                "state": "ready", "retry_after_seconds": 3, "content_sha256": digest, "bytes": len(content)})
         if path.endswith("/evidence.xlsx"):
             return httpx.Response(200, content=b"PK\x03\x04synthetic-workbook")
         if path.startswith("jobs/"):
@@ -197,7 +206,7 @@ def test_external_convert_and_advertised_job_types(workspace):
     server = ExternalServer(job_types=["convert", "validate"])
     bridge = make_bridge(workspace, server)
     result, payload = call(bridge, "submit_file", path="configs/asa.cfg", source_vendor="cisco_asa",
-                           target_vendor="palo_alto", options={"file_name": "asa.cfg"})
+                           target_vendor="palo_alto_set", options={"file_name": "asa.cfg"})
     assert result["isError"] is False and set(payload) == {"job_id", "status", "sha256", "bytes"}
     post = [r for r in server.requests if r.method == "POST"][0]
     body = json.loads(post.content)
@@ -213,7 +222,7 @@ def test_external_convert_and_advertised_job_types(workspace):
     assert payload["error"] == "invalid_arguments"
     # #11: technology is set from the vendor code, never from options (it used to pass through).
     _, payload = call(bridge, "submit_file", path="configs/asa.cfg", source_vendor="cisco_asa",
-                      target_vendor="palo_alto", options={"technology": "firewall"})
+                      target_vendor="palo_alto_set", options={"technology": "firewall"})
     assert payload["error"] == "invalid_arguments" and "technology" in payload["message"]
 
 
@@ -232,7 +241,7 @@ def test_clerk_token_refused_by_rest_gives_clear_message(workspace):
 
     bridge = make_bridge(workspace, server, credential=Session())
     result, payload = call(bridge, "submit_file", path="configs/asa.cfg", source_vendor="cisco_asa",
-                           target_vendor="palo_alto")
+                           target_vendor="palo_alto_set")
     assert payload["error"] == "unauthorized" and "netconverter login" in payload["message"]
 
 
@@ -321,7 +330,7 @@ class RemoteServer:
                                          "error": {"code": -32601, "message": "nope"}})
 
 
-LOCAL = ["submit_file", "job_status", "wait_for_job", "account", "download", "preview_diagram"]
+LOCAL = ["list_workspace_files", "submit_file", "job_status", "wait_for_job", "account", "download", "preview_diagram"]
 
 
 def remote_bridge(workspace, tools, strict=False):

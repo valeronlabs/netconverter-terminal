@@ -111,7 +111,7 @@ def _current_user_sid_text() -> str:
             _k.CloseHandle(token)
 
 
-def _open(path: Path, access: int, disposition: int, directory: bool) -> int:
+def _open(path: Path, access: int, disposition: int, directory: bool, *, write_through=False) -> int:
     descriptor = wintypes.LPVOID()
     security = None
     if disposition == _CREATE_NEW:
@@ -128,7 +128,8 @@ def _open(path: Path, access: int, disposition: int, directory: bool) -> int:
         share = _SHARE_READ | (_SHARE_WRITE if directory else 0)
         handle = _k.CreateFileW(str(path), access, share,
                                 ctypes.byref(security) if security is not None else None,
-                                disposition, _OPEN_REPARSE | (_BACKUP if directory else 0), None)
+                                disposition, _OPEN_REPARSE | (_BACKUP if directory else 0)
+                                | (0x80000000 if write_through else 0), None)
     finally:
         if descriptor.value:
             _k.LocalFree(descriptor)
@@ -198,7 +199,7 @@ def _fd_from_owned_handle(handle: int, flags: int) -> int:
         raise
 
 
-def _read(handle: int, limit: int) -> bytes:
+def _read(handle: int, limit: int, *, allow_empty=False) -> bytes:
     # Duplicate so the original handle continues to pin the name and contents.
     process = _k.GetCurrentProcess()
     duplicate = wintypes.HANDLE()
@@ -207,7 +208,7 @@ def _read(handle: int, limit: int) -> bytes:
     fd = _fd_from_owned_handle(duplicate.value, os.O_RDONLY | os.O_BINARY)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+        if not stat.S_ISREG(info.st_mode) or not int(not allow_empty) <= info.st_size <= limit:
             _fail()
         chunks, left = [], limit + 1
         while left:
@@ -275,7 +276,7 @@ _k.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE
 _k.DuplicateHandle.restype = wintypes.BOOL
 
 
-def snapshot(workspace, filename: str, max_bytes: int):
+def snapshot(workspace, filename: str, max_bytes: int, *, allow_archives=False):
     if not isinstance(filename, str) or not filename or "\x00" in filename:
         raise WorkspaceError("Invalid draft input path")
     raw = Path(filename)
@@ -301,9 +302,8 @@ def snapshot(workspace, filename: str, max_bytes: int):
             _fail()
         data = _read(handle, max_bytes)
         _require_single_link(handle)
-        if b"\x00" in data:
-            _fail()
-        data.decode("utf-8")
+        from .draft_io import validate_source_bytes
+        validate_source_bytes(data, allow_archives=allow_archives)
         return candidate, data, hashlib.sha256(data).hexdigest()
     except (OSError, UnicodeDecodeError, ValueError):
         raise WorkspaceError("Draft input could not be read securely") from None
@@ -314,7 +314,7 @@ def snapshot(workspace, filename: str, max_bytes: int):
             _k.CloseHandle(h)
 
 
-def _rename(handle: int, directory: int, filename: str) -> None:
+def _rename(handle: int, directory: int, filename: str, *, replace_existing=False) -> None:
     units = len(filename.encode("utf-16-le")) // 2
     class Rename(ctypes.Structure):
         _fields_ = [("replace", wintypes.BOOL), ("root", wintypes.HANDLE),
@@ -322,12 +322,13 @@ def _rename(handle: int, directory: int, filename: str) -> None:
     # SetFileInformationByHandle rejects a non-null RootDirectory on some
     # Windows versions. The absolute destination remains confined by the
     # held, no-delete-sharing handles for every ancestor.
-    value = Rename(False, None, len(filename.encode("utf-16-le")), filename)
+    value = Rename(replace_existing, None, len(filename.encode("utf-16-le")), filename)
     if not _k.SetFileInformationByHandle(handle, 3, ctypes.byref(value), ctypes.sizeof(value)):
         raise OSError(ctypes.get_last_error(), "secure rename failed")
 
 
-def publish(workspace, filename: str, content: bytes, sha256: str) -> Path:
+def publish(workspace, filename: str, content: bytes, sha256: str, *,
+            allow_empty=False, require_owner_acl=True) -> Path:
     handles, handle, published = [], None, False
     temporary = workspace.root / (".nc-draft-" + uuid.uuid4().hex)
     destination = workspace.root / filename
@@ -340,8 +341,10 @@ def publish(workspace, filename: str, content: bytes, sha256: str) -> Path:
                 raise
         else:
             try:
-                if not _protected_owner_acl(existing) or _read(existing, len(content)) != content:
+                if ((require_owner_acl and not _protected_owner_acl(existing))
+                        or _read(existing, len(content), allow_empty=allow_empty) != content):
                     _fail()
+                _require_single_link(existing)
                 return destination
             finally:
                 _k.CloseHandle(existing)

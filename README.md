@@ -2,12 +2,14 @@
 
 <!-- mcp-name: ai.netconverter/netconverter -->
 
-**Migrate, validate and optimize network configurations from the folder that holds them — and let your own AI assistant do it too, without the configuration ever passing through the model.**
+**Migrate, validate and optimize network configurations from the folder that holds them, with direct file transport for your AI assistant.**
+
+Version 0.8.0. Installed macOS stdio workflows and Linux/Windows CI are verified; native Windows end-to-end and individual hosted assistant workflows retain separate acceptance scopes.
 
 NetConverter — by ValeronLabs LLC.
 
 ```text
-◆ NetConverter  v0.7.3                      ● Server   ◆ Bridge claude-code · 2m ago
+◆ NetConverter  v0.8.0                      ● Server   ◆ Bridge claude-code · 2m ago
 ▍ Start
 ▍ /convert    Migrate a configuration to another vendor
 ▍ /validate   Check a configuration before migrating
@@ -24,7 +26,7 @@ One small client, three ways in:
 | | What it is |
 | --- | --- |
 | `netconverter` | A keyboard-first full-screen app: pick a file, answer a few inline questions, follow the job, get verified outputs beside your source. |
-| `netconverter mcp` | A local MCP bridge for Claude Code, Claude Desktop, Cursor, VS Code and Codex. Your AI passes a **file path**; the bridge reads the file and uploads it straight to NetConverter. The AI sees paths, job IDs and summaries — never the configuration. |
+| `netconverter mcp` | A local MCP bridge for Claude Code, Claude Desktop, Cursor, VS Code and Codex. Your AI passes a **file path**; the bridge reads the file and uploads it straight to NetConverter. Automatic file-transfer responses contain paths, hashes, job IDs and summaries. Authorized result tools can expose configuration sections under the account and workspace privacy settings. |
 | `netconverter validate edge.cfg --vendor fortinet` | Plain one-shot commands that print JSON, for scripts and CI. |
 
 ## What it supports
@@ -117,7 +119,7 @@ confirmation without showing it (ChatGPT, Claude Code), approve in the conversat
 bridge with `--no-upload-confirm`.
 
 Bridge tools: `submit_file`, `job_status`, `wait_for_job`, `account`, `download`,
-plus an allowlist of NetConverter's tools (reports, evidence, NAT, flows, knowledge base,
+plus an allowlist of NetConverter's tools (reports, evidence, why a job needs review, NAT, flows, knowledge base,
 guided mapping and guided migration). What the assistant sees is this folder's **exposure level**
 (`netconverter privacy level none|masked|selected|full`, default **masked**: the strict view,
 names as tokens, addresses masked, no configuration content); secrets are removed at every
@@ -134,6 +136,27 @@ hold the assistant at masked.
 
 Inside the app, `/activity` and the header's **Bridge** pill show what your AI did
 through the bridge — paths, sizes, SHA-256 and job IDs only.
+
+### Resume an evidence workbook
+
+For full API conversion jobs, `download` saves verified configuration/report files and
+prepares the workbook once. `complete: false` means the bundle is incomplete; inspect
+`files`, `pending_export`, and `failure` separately. `export_reference` retains the
+exact resume arguments even if a later status response is lost. Saved file receipts remain valid.
+After the returned retry interval, call `download` with the same `job_id`,
+`artifact_kind: "evidence-workbook"`, and the returned `export_id`. This checks that
+export and downloads only its workbook when ready, without fetching primary files again.
+Each call performs bounded work; there is no background client polling.
+
+A timeout leaves the response outcome unknown. If preparation returned no export ID,
+reconcile it before explicitly preparing again. Failed, stale, inaccessible, and older-server
+exports are reported as incomplete; the client never regenerates an export during resume
+or invokes the legacy synchronous workbook endpoint. Review a stale/failed export before
+explicitly preparing a replacement. Export bytes stay out of model replies. Content type,
+length, and the server SHA-256 must agree before atomic, non-overwriting publication.
+The **50 MiB workbook download ceiling** is separate from the configurable source-upload
+policy. Validation/optimization, Quick, diagram, and YAML/NCIR download contracts are unchanged.
+This workflow has synthetic contract coverage; live server/client qualification is pending.
 
 ### Show a diagram in IDE chat
 

@@ -147,6 +147,14 @@ netconverter update --yes                # same, without the prompt
 folder's exposure level decides what the assistant sees. Run `connect` again to drop an old `--strict`,
 which would hold the assistant at masked after you raise the level.
 
+The example `~/migrations` is an installer default, not a required folder.
+`netconverter --workspace "/absolute/customer folder" run` opens the interactive
+app; `netconverter mcp --workspace "/absolute/customer folder"` is the separate
+stdio bridge an assistant launches. The latter does not create a public HTTP
+endpoint or let hosted ChatGPT read your disk. `connect` pins the selected folder;
+reconfigure and reconnect the assistant when intentionally changing that folder.
+See [the three working modes](../QUICK_START.md#choose-how-you-want-to-work).
+
 ### Exposure levels (`privacy`)
 
 `netconverter privacy level LEVEL` sets what assistants connected to this folder may see; the
@@ -200,7 +208,7 @@ changes nothing locally; those apps read jobs, results and the knowledge base bu
 submit files. `--all` connects every local assistant whose config folder exists and that
 is not connected yet. `--print` shows every change without writing; `--yes` applies all of them.
 
-`update` reads the latest release of `valeronlabs/netconverter_terminals` from the
+`update` reads the latest release of `valeronlabs/netconverter-terminal` from the
 public GitHub API, downloads the wheel and `SHA256SUMS` to a temporary folder,
 installs only when the SHA-256 matches, and runs `uv tool install --force <wheel>`.
 Without `uv` on PATH it prints the steps instead and exits 1.
@@ -271,14 +279,16 @@ configuration text). Default: `compare_against_intent`, `fetch`, `get_account`,
 `get_unused_objects`, `get_vpn_summary`, `get_zone_summary`, `kb_explain`,
 `kb_search`, `list_jobs`, `list_objects_with_attribute`, `list_rules_matching`,
 `query_ir`, `search`, `select_job`, `simulate_flow`, `vendor_capability_lookup`,
-`get_mapping_questions`, `validate_mapping`, `apply_mapping_answers`, `list_operations`,
+`why_needs_review`, `get_mapping_questions`, `validate_mapping`, `apply_mapping_answers`, `list_operations`,
 `get_decision_document`, `validate_decision_document`, `propose_operations`, `submit_conversion`,
 `set_view_level` (lowers the server's view for the session; it can never raise it).
 At levels `none`, `masked` and `selected` (the default is masked; `full` uses the default list):
 `list_jobs`, `select_job`, `get_account`, `search`, `fetch`,
 `kb_search`, `kb_explain`, `vendor_capability_lookup`, `get_job_brief`,
-`get_evidence`, `get_report`, the three guided-mapping tools, plus the chosen sections' tools under `selected`. A listed tool appears
-only if the server offers it.
+`get_evidence`, `get_report`, `why_needs_review`, the three guided-mapping tools, plus the chosen sections' tools under `selected`. A listed tool appears
+only if the server offers it. `why_needs_review` (aws#1494: the ranked readiness checks that hold a job,
+each with a count, up to five items, the remediation and the evidence section) needs a server that offers
+it; on an older server a call returns `server_upgrade_required` ("needs a newer NetConverter server").
 The bridge sends the level on every request (`X-NetConverter-View: none|masked|selected|full`;
 the server may only lower the grant's view, never raise it) and reads the view in force from
 `get_account`. Until the server applies it, the bridge enforces strict locally: it refuses
@@ -343,9 +353,10 @@ file is reported as a missing file, never as "not signed in".
 | Full-screen UI unsuitable | Use `netconverter plain` or individual CLI commands |
 | "the credentials are in the encrypted file …, which this process cannot open" | Set `NETCONVERTER_CREDENTIAL_PASSPHRASE` (or `NETCONVERTER_CREDENTIAL_PASSPHRASE_FILE`) to the passphrase used at sign-in, in the shell or in the AI client's `env` for the bridge. "does not open" means a wrong passphrase or an altered file |
 | "Your system keyring is locked" (exit 3) | The OS keyring did not answer within 5 seconds (a locked Secret Service collection after a reboot, or a keychain waiting for a password). Unlock it (for example by logging in to the desktop session), or sign in again with `netconverter login` |
+| `keyring_unreachable` from the bridge (macOS) | Run the same installation under the same macOS user, unlock the login Keychain, and respond to any OS permission prompt yourself. Check `netconverter whoami`, then reconnect. Do not change privacy or paste credentials into chat. |
 | `keyring_unreachable` from the bridge (Linux) | The assistant launched `netconverter mcp` without `DBUS_SESSION_BUS_ADDRESS`; the bridge tries `$XDG_RUNTIME_DIR/bus` and `/run/user/<uid>/bus`, else set that variable (or `NETCONVERTER_API_KEY`) in the assistant's MCP server environment and restart it |
 | `submit_file` always fails `upload_declined` / `confirmation_required` (ChatGPT, Claude Code) | The assistant declines confirmation forms without showing them. Say yes in the conversation so it can retry with the `confirm_token`, or start the bridge with `--no-upload-confirm` (`NETCONVERTER_MCP_UPLOAD_CONFIRM=0`) |
-| Guided tools (`list_operations`, `submit_conversion` …) missing | They need exposure level `full` (`netconverter privacy level full`, then reconnect the assistant); the two write tools also need the tenant to have them enabled. `account` → `guided_migration` says which |
+| Guided tools missing | Read `account` → `guided_migration.tools` and the actual catalog. Masked sessions can expose mapping questions/validation when advertised. Broader editing requires full exposure; writes additionally require server permission. Exposure cannot grant that permission. |
 | Assistant cannot see a NetConverter tool | The bridge lists only allowlisted remote tools the server offers (fewer below `full`; `netconverter privacy status` shows the level); update the client with `netconverter update` |
 | `netconverter update` says uv is not on PATH | Install uv, or follow the printed download, `shasum -a 256 -c SHA256SUMS` and `uv tool install --force` steps |
 

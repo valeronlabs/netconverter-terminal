@@ -67,6 +67,7 @@ def test_keyring_problem_is_empty_for_an_os_store(monkeypatch):
 
 def test_bridge_without_a_credential_explains_an_unreachable_keyring(tmp_path, monkeypatch):
     from netconverter_cli import mcp_server
+    monkeypatch.setattr(credentials.sys, "platform", "linux")
 
     monkeypatch.setattr(mcp_server, "keyring_problem",
                         lambda: "no D-Bus session bus: DBUS_SESSION_BUS_ADDRESS is not set")
@@ -84,6 +85,7 @@ def test_bridge_without_a_credential_explains_an_unreachable_keyring(tmp_path, m
 
 def test_bridge_without_a_credential_and_a_working_keyring_says_sign_in(tmp_path, monkeypatch):
     from netconverter_cli import mcp_server
+    monkeypatch.setattr(credentials.sys, "platform", "linux")
 
     monkeypatch.setattr(mcp_server, "keyring_problem", lambda: "")
     bridge = Bridge(tmp_path, "https://api.example/external/v1", None)
@@ -101,3 +103,11 @@ def test_mcp_startup_line_names_the_unreachable_keyring(monkeypatch, capsys):
         "auto", "https://api.netconverter.ai/external/v1", "https://api.netconverter.ai/mcp/v1/")
     assert rest is None and remote is None and source == "none"
     assert any("DBUS_SESSION_BUS_ADDRESS" in n for n in notes)
+
+
+def test_mac_keyring_guidance_never_prescribes_linux_bus(monkeypatch):
+    monkeypatch.setattr(credentials.sys, "platform", "darwin")
+    hint = credentials.credential_access_hint()
+    assert "Keychain" in hint and "same macOS user" in hint
+    assert "DBUS" not in hint and "/run/user" not in hint
+    assert "Do not paste credentials" in hint
