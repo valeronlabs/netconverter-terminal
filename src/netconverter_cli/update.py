@@ -206,16 +206,21 @@ def _has_direct_url() -> bool:
         return True
 
 
-def from_pypi(prefix=None, direct_url=_has_direct_url) -> bool:
-    """True when this copy is a `uv tool install netconverter-cli` from the package index."""
+def _uv_requirement(prefix=None) -> dict | None:
     try:
         receipt = tomllib.loads((Path(prefix or sys.prefix) / "uv-receipt.toml").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return None
     for req in (receipt.get("tool") or {}).get("requirements") or []:
         if isinstance(req, dict) and req.get("name") == DIST:
-            return not any(key in req for key in _DIRECT_KEYS) and not direct_url()
-    return False
+            return req
+    return None
+
+
+def from_pypi(prefix=None, direct_url=_has_direct_url) -> bool:
+    """True when this copy is a `uv tool install netconverter-cli` from the package index."""
+    req = _uv_requirement(prefix)
+    return req is not None and not any(key in req for key in _DIRECT_KEYS) and not direct_url()
 
 
 # -- `netconverter update` ------------------------------------------------
@@ -276,14 +281,36 @@ def run(args, *, transport=None, runner=subprocess.run, which=shutil.which, ask=
 
 
 def _upgrade_from_pypi(args, release, uv, runner, ask) -> int:
-    print(f"Update NetConverter CLI {__version__} → {release['version']} (PyPI, `uv tool upgrade {DIST}`).")
+    target = release["version"]
+    print(f"Update NetConverter CLI {__version__} → {target} (PyPI, `uv tool upgrade {DIST}`).")
     if not args.yes and ask("Upgrade it now? [y/N] ").strip().lower() not in {"y", "yes"}:
         print("Nothing was changed.")
         return 0
     if runner([uv, "tool", "upgrade", DIST]).returncode != 0:
         print("uv tool upgrade failed; your current version is unchanged.", file=sys.stderr)
         return 1
-    print("Upgraded NetConverter CLI from PyPI. Run `netconverter --version` to confirm.")
+    # The running module keeps its original __version__ even after uv changes the installation.
+    try:
+        installed = metadata.version(DIST)
+    except metadata.PackageNotFoundError:
+        installed = None
+    actual = parse_version(installed)
+    if actual is None:
+        print("uv tool upgrade finished, but could not verify the installed NetConverter CLI version.",
+              file=sys.stderr)
+        return 1
+    if actual < parse_version(target):
+        if actual == parse_version(__version__):
+            print(f"NetConverter CLI is still installed at {installed}.", file=sys.stderr)
+            requirement = _uv_requirement() or {}
+            if requirement.get("specifier") == f"=={installed}":
+                print("uv kept your exact version pin. To replace it with the available release, run:\n"
+                      f"  uv tool install --force {DIST}=={target}", file=sys.stderr)
+        else:
+            print(f"uv installed NetConverter CLI {installed}, which is older than the available release {target}.",
+                  file=sys.stderr)
+        return 1
+    print(f"Upgraded NetConverter CLI to {installed} from PyPI.")
     return 0
 
 

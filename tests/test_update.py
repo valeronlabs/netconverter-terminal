@@ -206,15 +206,57 @@ def test_pypi_install_is_detected_from_the_uv_receipt(tmp_path):
     assert not update.from_pypi(tmp_path / "none", direct_url=lambda: False)  # pip/venv, no receipt
 
 
-def test_pypi_install_runs_uv_tool_upgrade(capsys):
+def test_pypi_install_runs_uv_tool_upgrade(capsys, monkeypatch):
     calls = []
     github = GitHub()
+    monkeypatch.setattr(update.metadata, "version", lambda name: "9.8.7")
     code = update.run(args(yes=True), transport=httpx.MockTransport(github), which=lambda name: "/opt/bin/uv",
                       runner=lambda argv: calls.append(argv) or SimpleNamespace(returncode=0),
                       pypi=lambda: True)
     assert code == 0 and calls == [["/opt/bin/uv", "tool", "upgrade", "netconverter-cli"]]
     assert [str(r.url) for r in github.requests] == [update.LATEST_URL]  # no wheel download
-    assert "PyPI" in capsys.readouterr().out
+    assert "Upgraded NetConverter CLI to 9.8.7 from PyPI" in capsys.readouterr().out
+
+
+def test_pypi_upgrade_unchanged_with_exact_uv_pin(capsys, tmp_path, monkeypatch):
+    pinned = receipt(tmp_path / "pinned", f'{{ name = "netconverter-cli", specifier = "=={__version__}" }}')
+    monkeypatch.setattr(update.sys, "prefix", str(pinned))
+    monkeypatch.setattr(update.metadata, "version", lambda name: __version__)
+    github = GitHub()
+
+    def unchanged(argv):
+        assert argv == ["/opt/bin/uv", "tool", "upgrade", "netconverter-cli"]
+        print("Nothing to upgrade")
+        return SimpleNamespace(returncode=0)
+
+    code = update.run(args(yes=True), transport=httpx.MockTransport(github), which=lambda name: "/opt/bin/uv",
+                      runner=unchanged, pypi=lambda: update.from_pypi(direct_url=lambda: False))
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "Nothing to upgrade" in captured.out
+    assert "Upgraded" not in captured.out
+    assert f"still installed at {__version__}" in captured.err
+    assert "exact version pin" in captured.err
+    assert "uv tool install --force netconverter-cli==9.8.7" in captured.err
+    assert [str(r.url) for r in github.requests] == [update.LATEST_URL]
+
+
+@pytest.mark.parametrize(("installed", "error"), [(None, "could not verify"), ("9.8.6", "older than")])
+def test_pypi_upgrade_does_not_report_unverified_target(capsys, monkeypatch, installed, error):
+    def installed_version(name):
+        if installed is None:
+            raise update.metadata.PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setattr(update.metadata, "version", installed_version)
+    code = update.run(args(yes=True), transport=httpx.MockTransport(GitHub()), which=lambda name: "/opt/bin/uv",
+                      runner=lambda argv: SimpleNamespace(returncode=0), pypi=lambda: True)
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "Upgraded" not in captured.out
+    assert error in captured.err
 
 
 def test_pypi_upgrade_failure_is_reported(capsys):
