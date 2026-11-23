@@ -336,8 +336,12 @@ def check_source_vendor(vendor: str, catalog) -> None:
     if not vendor:  # #8: name the codes instead of argparse's bare "required"
         raise CommandError(VENDOR_REQUIRED + (f" Valid --vendor codes: {', '.join(sources)}." if sources else
                                               " `netconverter capabilities` lists the codes."), EXIT_USAGE)
-    if not catalog.loaded or vendor in catalog.vendors:
+    if not catalog.loaded or vendor in sources:
         return
+    if vendor in catalog.vendors:  # #78: listed by the server, but only as a target
+        raise CommandError(f"netconverter: {vendor!r} is a target only, not a source. "
+                           f"Valid --vendor codes: {', '.join(sources) or 'none listed'}; "
+                           "`netconverter capabilities` shows names and conversion paths.", EXIT_USAGE)
     raise CommandError(f"netconverter: unknown source vendor {vendor!r} (there is no 'auto'). "
                        f"Valid --vendor codes: {', '.join(sources) or 'none listed'}; "
                        "`netconverter capabilities` shows names and conversion paths.", EXIT_USAGE)
