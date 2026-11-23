@@ -23,8 +23,10 @@ VENDOR_IDENTITIES = {
                      "fortinet", "cisco_fmc", "check_point"), "firewall"),
     **dict.fromkeys(("cisco_ios_xe_router", "juniper_junos_router", "juniper_set_router"), "router"),
     **dict.fromkeys(("cisco_ios_xe_switch", "juniper_junos_switch", "juniper_set_switch",
-                     "aruba_cx_switch", "aruba_os_switch"), "switch"),
+                     "aruba_cx_switch", "aruba_os_switch", "cisco_nxos_switch"), "switch"),
 }
+# Identities the server emits but never reads: valid as a target, refused as a source.
+TARGET_ONLY = frozenset({"cisco_nxos_switch"})
 # Public submit-door aliases whose canonical code is an accepted identity.
 # SCM, bare ArubaOS, Cisco and Juniper aliases do not open new submit paths.
 VENDOR_ALIASES = {"aruba_cx": "aruba_cx_switch", "fortinet_fortigate": "fortinet",
@@ -85,6 +87,8 @@ def normalize_vendor(code: str) -> str:
 
 def submission_vendors(source: str, target: str | None) -> tuple[str, str | None]:
     source = normalize_vendor(source)
+    if source in TARGET_ONLY:
+        raise ValueError(f"{source} is a target only; it cannot be a source")
     target = normalize_vendor(target) if target is not None else None
     if target and device_type_of(source) != device_type_of(target):
         raise ValueError("Source and target must have the same device type")
