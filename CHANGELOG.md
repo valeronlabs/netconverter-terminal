@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1 — 2026-11-23
+
+- Accept `cisco_nxos_switch` as a conversion target, so the Juniper switch → Cisco NX-OS preview paths (`juniper_junos_switch` and `juniper_set_switch`) the server lists in `netconverter capabilities` submit from the CLI and the local MCP bridge instead of being refused before upload (#78). NX-OS is a target only: it is refused as a source before any file is read or sent, and `--vendor` names the valid source codes when given a target-only code. Ambiguous codes without a router or switch identity stay refused; upload confirmation and workspace confinement are unchanged. The path is a server preview; this release adds no platform qualification.
+- `netconverter update` checks the installed version after `uv tool upgrade` and no longer reports success when the old version is still installed; when uv kept an exact version pin it prints the pinned install command to run (#77).
+
 ## 0.8.0 — 2026-11-20
 
 - Report the guided mapping tools actually advertised in masked sessions instead of claiming that none exist. Preserve strict filtering and tenant write permissions (#73).
