@@ -1,6 +1,6 @@
 """#86/#80: hosted tools need bridge discovery and the existing queue confirmation.
 
-Frozen public tool schemas from the authorized hosted tools/list on 2026-11-25;
+Frozen public tool schemas from the authorized hosted tools/list on 2026-11-24;
 all calls/results below are synthetic. This proves transport, not server admission.
 """
 import copy
@@ -61,7 +61,8 @@ def test_full_discovery_preserves_hosted_schema_and_adds_only_local_confirmation
         if tool["name"] in WRITES:
             assert actual["inputSchema"]["properties"].pop("confirm_token")["type"] == "string"
         if tool["name"] == "rerun_job":
-            assert actual["inputSchema"]["required"].pop() == "job_id"
+            assert actual["inputSchema"]["required"][-2:] == ["job_id", "idempotency_key"]
+            del actual["inputSchema"]["required"][-2:]
         assert actual == tool
     assert remote.tools == original
 
@@ -181,8 +182,36 @@ def test_start_job_analysis_form_has_no_conversion_target(tmp_path, job_type):
 def test_rerun_requires_an_explicit_job_before_confirmation(tmp_path, job_id):
     bridge, remote = make_bridge(tmp_path)
     bridge.confirm_apply = lambda _: pytest.fail("A mutable selected job cannot be approved")
-    args = {} if job_id is None else {"job_id": job_id}
+    args = {"idempotency_key": "synthetic-rerun-86"}
+    if job_id is not None:
+        args["job_id"] = job_id
     assert payload(bridge.call("rerun_job", args))["error"] == "invalid_arguments"
+    assert not remote.calls
+
+
+@pytest.mark.parametrize("name", WRITES)
+@pytest.mark.parametrize("key", [None, "", "has spaces", "x" * 81, 86])
+def test_queue_requires_a_stable_retry_key_before_confirmation(tmp_path, name, key):
+    bridge, remote = make_bridge(tmp_path)
+    bridge.confirm_apply = lambda _: pytest.fail("A non-idempotent job cannot be approved")
+    args = {k: v for k, v in WRITES[name].items() if k != "idempotency_key"}
+    if key is not None:
+        args["idempotency_key"] = key
+    assert payload(bridge.call(name, args))["error"] == "invalid_arguments"
+    assert not remote.calls
+
+
+@pytest.mark.parametrize("name", WRITES)
+def test_lowering_exposure_during_confirmation_cancels_the_approved_call(tmp_path, name):
+    bridge, remote = make_bridge(tmp_path, workspace_level=True)
+    exposure.set_level(tmp_path, "full", interactive=True, ask=lambda _: "raise to full")
+
+    def lower_and_accept(_):
+        exposure.set_level(tmp_path, "masked", interactive=False)
+        return "accept"
+
+    bridge.confirm_apply = lower_and_accept
+    assert payload(bridge.call(name, WRITES[name]))["error"] == "approval_context_changed"
     assert not remote.calls
 
 

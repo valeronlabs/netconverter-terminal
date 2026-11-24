@@ -9,8 +9,10 @@
 - Confirm `start_job`, `start_prescan` and `rerun_job` with the existing queue approval
   flow, preserving exact-argument single-use tokens and server idempotency keys. These
   tools require full exposure and server advertisement. A rerun requires an explicit
-  job ID so approval cannot follow a changed session selection. Server admission and
-  prescan approval requirements remain authoritative.
+  job ID and retry key so approval cannot follow a changed session selection or
+  accidentally duplicate an ambiguous retry. Sign-in or workspace privacy changes
+  while a confirmation is open cancel that approval. Server admission and prescan
+  approval requirements remain authoritative.
 - Includes the private 0.8.2 Claude Code reconnect correction (#84). Public publication
   and installed-client qualification remain separate from this private candidate.
 

@@ -19,6 +19,36 @@ from tests.test_clerk import form, oauth_server
 from tests.test_mcp import AccountServer, RemoteServer
 
 
+@pytest.mark.parametrize('name', ['start_job', 'start_prescan', 'rerun_job'])
+@pytest.mark.parametrize('replacement', ['new-login', None])
+def test_login_change_during_queue_confirmation_cannot_use_prior_approval(tmp_path, name, replacement):
+    from tests.test_issue_86_mcp_parity import WRITES, payload
+
+    store = Store(tokens('old'))
+    credential = ClerkSession(store)
+    upstream = RemoteServer()
+    upstream.tools = (name,)
+    upstream.require_token = 'synthetic-access-old'
+    remote = RemoteMCP('https://api.example/mcp/v1', credential,
+                       transport=httpx.MockTransport(upstream))
+    bridge = Bridge(tmp_path, 'https://api.example/external/v1', credential,
+                    remote=remote, credential_source='clerk_session', level='full')
+
+    def change_login_and_accept(_):
+        store.save(tokens(replacement) if replacement else None)
+        upstream.require_token = 'synthetic-access-new-login'
+        upstream.tools = ('get_account',)
+        return 'accept'
+
+    bridge.confirm_apply = change_login_and_accept
+    try:
+        result = payload(bridge.call(name, WRITES[name]))
+        assert result['error'] in {'approval_context_changed', 'not_signed_in'}
+        assert not [r for r in upstream.requests if json.loads(r.content).get('method') == 'tools/call']
+    finally:
+        remote.close()
+
+
 class Store:
     def __init__(self, value=None, *, clear_works=True):
         self.value = value

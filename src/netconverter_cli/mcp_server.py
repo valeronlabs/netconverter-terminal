@@ -1417,10 +1417,11 @@ class Bridge:
                 if isinstance(properties, dict):
                     properties.setdefault("confirm_token", CONFIRM_TOKEN_SCHEMA)
                     if name == "rerun_job":
-                        # Approval must name a job, not a mutable session selection.
+                        # Bind approval to a job and make an ambiguous retry safe.
                         required = schema.setdefault("required", [])
-                        if "job_id" not in required:
-                            required.append("job_id")
+                        for field in ("job_id", "idempotency_key"):
+                            if field not in required:
+                                required.append(field)
                     tool["inputSchema"] = schema
             tools.append(tool)
         self._prescan_receipts = receipt_schema and {
@@ -1500,8 +1501,13 @@ class Bridge:
         except ToolFailure as exc:
             return _error_result(exc.code, str(exc), **exc.extra)
         if remote_name in CONFIRM_REMOTE and not receipt_submission:
+            confirmed_generation = self._credential_generation
             arguments = dict(arguments)
             token = arguments.pop("confirm_token", None)
+            if remote_name in {"rerun_job", "start_job", "start_prescan"} and (
+                    not isinstance(arguments.get("idempotency_key"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", arguments["idempotency_key"])):
+                return _error_result("invalid_arguments", "Provide a stable idempotency_key (1-80 letters, digits, underscores or hyphens); reuse it for retries of this intended job")
             if remote_name == "rerun_job" and (
                     not isinstance(arguments.get("job_id"), str)
                     or not _JOB_ID.fullmatch(arguments["job_id"])):
@@ -1533,6 +1539,17 @@ class Bridge:
                               ("apply_declined", what))
             except ToolFailure as exc:
                 return _error_result(exc.code, str(exc), **exc.extra)
+            # A form can stay open while a terminal changes its login or privacy.
+            # That answer cannot authorize work under the replacement context.
+            try:
+                self._reload_credential()
+            except (ClerkError, RemoteError) as exc:
+                self._confirm_tokens.clear()
+                return _error_result("not_signed_in", str(exc))
+            current_exposure = self.exposure
+            if self._credential_generation != confirmed_generation or current_exposure != exposure:
+                self._confirm_tokens.clear()
+                return _error_result("approval_context_changed", "The sign-in or workspace privacy changed during confirmation; nothing was queued. Review the current account and tool list, then request fresh approval")
         self._sync_view(exposure)
         if not exposure.strict:
             try:
