@@ -4,12 +4,12 @@
 
 **Migrate, validate and optimize network configurations from the folder that holds them, with direct file transport for your AI assistant.**
 
-Version 0.8.1. Qualification is unchanged from 0.8.0: installed macOS stdio workflows and Linux/Windows CI are verified; native Windows end-to-end and individual hosted assistant workflows retain separate acceptance scopes.
+Version 0.8.2 is a private candidate with focused local bridge proof. Release qualification is unchanged from 0.8.0: installed macOS stdio workflows and Linux/Windows CI are verified; native Windows end-to-end and individual hosted assistant workflows retain separate acceptance scopes.
 
 NetConverter — by ValeronLabs LLC.
 
 ```text
-◆ NetConverter  v0.8.1                      ● Server   ◆ Bridge claude-code · 2m ago
+◆ NetConverter  v0.8.2                      ● Server   ◆ Bridge claude-code · 2m ago
 ▍ Start
 ▍ /convert    Migrate a configuration to another vendor
 ▍ /validate   Check a configuration before migrating

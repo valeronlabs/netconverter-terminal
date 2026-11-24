@@ -149,12 +149,14 @@ PRESCAN_NEXT_STEPS = (
     "completed, call list_operations, get_decision_document and validate_decision_document "
     "with this job_id. Ask the user about every decision (never assume skip), record the "
     "choices with propose_operations (pass base_sha256), then validate the exact revision. "
-    "When request_submission_review and get_submission_approval are listed, request a review "
-    "for that revision and have the user complete its portal review. Read get_submission_approval; "
+    "If the account requires prescan human approval, use request_submission_review for that "
+    "revision and have the user complete its portal review. Read get_submission_approval; "
     "only a server-issued approved receipt authorizes submit_conversion with the same revision, "
     "draft_id, approval_ref and a stable idempotency_key. That receipt needs no second bridge "
-    "confirmation. A pending review URL is not approval. On older servers, submit_conversion "
-    "uses the existing confirmation flow. "
+    "confirmation. A pending review URL is not approval. Otherwise call submit_conversion with "
+    "the exact job_id and revision and a stable idempotency_key, following the bridge confirmation. "
+    "Listed review tools alone do not require portal review. A server approval_required refusal "
+    "must be resolved through its approval flow; local confirmation cannot override it. "
     "The write tools are listed only at exposure level full and where the tenant has them "
     "enabled; account says which.")
 CONFIRM_TTL_S = 600
@@ -1427,7 +1429,9 @@ class Bridge:
         Never downgrade receipt-shaped requests to the legacy confirmation path:
         an old server could otherwise ignore the receipt and queue a plain job.
         """
-        if not {"draft_id", "approval_ref", "idempotency_key"} & set(arguments):
+        # Ordinary submissions also accept a retry key. Only approval-specific
+        # handles opt into receipt transport, even when just one is supplied.
+        if not {"draft_id", "approval_ref"} & set(arguments):
             return False
         if not self._prescan_receipts:
             raise ToolFailure("server_upgrade_required", "This server does not offer exact-revision approval receipts")
