@@ -106,6 +106,8 @@ REMOTE_TOOLS_DEFAULT = frozenset({
     "get_object_dependencies", "get_object_summary", "get_report", "get_route_summary",
     "get_target_config", "get_translation_edge_summary", "get_unused_objects",
     "get_vpn_summary", "get_zone_summary", "kb_explain", "kb_search", "list_jobs",
+    "get_mop", "list_artifacts", "diff_runs", "prove_flows", "explain_rule", "list_source_files",
+    "rerun_job", "start_job", "start_prescan",
     "list_objects_with_attribute", "list_rules_matching", "query_ir", "search",
     "select_job", "simulate_flow", "vendor_capability_lookup",
     # Ranked readiness holds from the stored evidence (aws#1494); scrubbed like get_evidence.
@@ -125,7 +127,7 @@ MAPPING_TOOLS = frozenset({"get_mapping_questions", "validate_mapping", "apply_m
 REMOTE_TOOLS_STRICT = frozenset({
     "list_jobs", "select_job", "get_account", "search", "fetch", "kb_search", "kb_explain",
     "vendor_capability_lookup", "get_job_brief", "get_evidence", "get_report", "get_diagram",
-    "why_needs_review",
+    "why_needs_review", "get_mop", "list_artifacts", "diff_runs",
 }) | MAPPING_TOOLS
 assert REMOTE_TOOLS_STRICT <= REMOTE_TOOLS_DEFAULT
 # Remote tools added after servers already in the field: an allowlisted name the server
@@ -142,19 +144,22 @@ GUIDED_TOOLS = GUIDED_READ_TOOLS + GUIDED_WRITE_TOOLS
 # ``submit_*`` stays blocked (a remote submit would take configuration text through the
 # model); submit_conversion takes only a prescan id and a revision.
 SUBMIT_ALLOWED = frozenset({"submit_conversion"})
-# Remote calls that queue a conversion: confirmed with the user first, like an upload.
-CONFIRM_REMOTE = frozenset({"apply_mapping_answers", "submit_conversion"})
+# Remote calls that queue work: confirmed with the user first, like an upload.
+CONFIRM_REMOTE = frozenset({"apply_mapping_answers", "submit_conversion",
+                            "rerun_job", "start_job", "start_prescan"})
 PRESCAN_NEXT_STEPS = (
     "The job stops at the prescan; nothing is converted yet. When wait_for_job reports it "
     "completed, call list_operations, get_decision_document and validate_decision_document "
     "with this job_id. Ask the user about every decision (never assume skip), record the "
     "choices with propose_operations (pass base_sha256), then validate the exact revision. "
-    "When request_submission_review and get_submission_approval are listed, request a review "
-    "for that revision and have the user complete its portal review. Read get_submission_approval; "
+    "If the account requires prescan human approval, use request_submission_review for that "
+    "revision and have the user complete its portal review. Read get_submission_approval; "
     "only a server-issued approved receipt authorizes submit_conversion with the same revision, "
     "draft_id, approval_ref and a stable idempotency_key. That receipt needs no second bridge "
-    "confirmation. A pending review URL is not approval. On older servers, submit_conversion "
-    "uses the existing confirmation flow. "
+    "confirmation. A pending review URL is not approval. Otherwise call submit_conversion with "
+    "the exact job_id and revision and a stable idempotency_key, following the bridge confirmation. "
+    "Listed review tools alone do not require portal review. A server approval_required refusal "
+    "must be resolved through its approval flow; local confirmation cannot override it. "
     "The write tools are listed only at exposure level full and where the tenant has them "
     "enabled; account says which.")
 CONFIRM_TTL_S = 600
@@ -592,8 +597,7 @@ class Bridge:
         # Set by the stdio server while submit_file runs for a client with form elicitation (#20):
         # called with the upload's path/size/hash, returns accept/decline/cancel, or None to proceed.
         self.confirm_upload = None
-        # The same for apply_mapping_answers (#12) and submit_conversion: asked before a
-        # conversion is queued.
+        # The same for CONFIRM_REMOTE: asked before remote work is queued.
         self.confirm_apply = None
         # False (--no-upload-confirm, NETCONVERTER_MCP_UPLOAD_CONFIRM=0): never send a form;
         # the AI client's own tool approval is the confirmation (#37).
@@ -1412,6 +1416,12 @@ class Bridge:
                 properties = schema.setdefault("properties", {})
                 if isinstance(properties, dict):
                     properties.setdefault("confirm_token", CONFIRM_TOKEN_SCHEMA)
+                    if name == "rerun_job":
+                        # Bind approval to a job and make an ambiguous retry safe.
+                        required = schema.setdefault("required", [])
+                        for field in ("job_id", "idempotency_key"):
+                            if field not in required:
+                                required.append(field)
                     tool["inputSchema"] = schema
             tools.append(tool)
         self._prescan_receipts = receipt_schema and {
@@ -1427,7 +1437,9 @@ class Bridge:
         Never downgrade receipt-shaped requests to the legacy confirmation path:
         an old server could otherwise ignore the receipt and queue a plain job.
         """
-        if not {"draft_id", "approval_ref", "idempotency_key"} & set(arguments):
+        # Ordinary submissions also accept a retry key. Only approval-specific
+        # handles opt into receipt transport, even when just one is supplied.
+        if not {"draft_id", "approval_ref"} & set(arguments):
             return False
         if not self._prescan_receipts:
             raise ToolFailure("server_upgrade_required", "This server does not offer exact-revision approval receipts")
@@ -1489,8 +1501,17 @@ class Bridge:
         except ToolFailure as exc:
             return _error_result(exc.code, str(exc), **exc.extra)
         if remote_name in CONFIRM_REMOTE and not receipt_submission:
+            confirmed_generation = self._credential_generation
             arguments = dict(arguments)
             token = arguments.pop("confirm_token", None)
+            if remote_name in {"rerun_job", "start_job", "start_prescan"} and (
+                    not isinstance(arguments.get("idempotency_key"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", arguments["idempotency_key"])):
+                return _error_result("invalid_arguments", "Provide a stable idempotency_key (1-80 letters, digits, underscores or hyphens); reuse it for retries of this intended job")
+            if remote_name == "rerun_job" and (
+                    not isinstance(arguments.get("job_id"), str)
+                    or not _JOB_ID.fullmatch(arguments["job_id"])):
+                return _error_result("invalid_arguments", "Provide an explicit job_id to confirm the exact job to re-run")
             answers = arguments.get("answers")
             details = {"job_id": str(arguments.get("job_id") or "the selected job"),
                        "answers": len(answers) if isinstance(answers, list) else 0}
@@ -1499,12 +1520,36 @@ class Bridge:
             what = (f"queue a conversion of {details['job_id']} at decision revision {details['revision']}"
                     if remote_name == "submit_conversion" else
                     f"apply {details['answers']} mapping answer(s) to {details['job_id']} and convert again")
+            if remote_name == "rerun_job":
+                details.update(tool=remote_name)
+                what = f"re-run {details['job_id']} on the current engine with its stored source and decisions"
+            elif remote_name in {"start_job", "start_prescan"}:
+                details = {key: arguments.get(key) for key in
+                           ("file_id", "source_vendor", "target_vendor", "device_type")}
+                details.update(tool=remote_name, job_type=("prescan" if remote_name == "start_prescan"
+                                                          else arguments.get("job_type")))
+                route = str(details["source_vendor"])
+                if details["target_vendor"]:
+                    route += f" → {details['target_vendor']}"
+                what = (f"start {details['job_type']} for uploaded file {details['file_id']} "
+                        f"({details['device_type']}, {route})")
             try:
                 self._confirm(self.confirm_apply, details,
                               (remote_name, json.dumps(arguments, sort_keys=True, default=str)), token,
                               ("apply_declined", what))
             except ToolFailure as exc:
                 return _error_result(exc.code, str(exc), **exc.extra)
+            # A form can stay open while a terminal changes its login or privacy.
+            # That answer cannot authorize work under the replacement context.
+            try:
+                self._reload_credential()
+            except (ClerkError, RemoteError) as exc:
+                self._confirm_tokens.clear()
+                return _error_result("not_signed_in", str(exc))
+            current_exposure = self.exposure
+            if self._credential_generation != confirmed_generation or current_exposure != exposure:
+                self._confirm_tokens.clear()
+                return _error_result("approval_context_changed", "The sign-in or workspace privacy changed during confirmation; nothing was queued. Review the current account and tool list, then request fresh approval")
         self._sync_view(exposure)
         if not exposure.strict:
             try:

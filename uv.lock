@@ -412,7 +412,7 @@ wheels = [
 
 [[package]]
 name = "netconverter-cli"
-version = "0.8.1"
+version = "0.8.3"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

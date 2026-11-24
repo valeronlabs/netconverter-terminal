@@ -198,12 +198,18 @@ _TEXT = {
         "vendor and device type; call account to see which job types this credential allows. "
         "For guided migration use submit_file(job_type='prescan'), then list_operations and bounded "
         "get_decision_document views. Ask about applicable decisions, apply the user's choices with "
-        "propose_operations and validate_decision_document at the resulting revision. When listed, "
-        "request_submission_review creates the exact-revision portal review; a URL or pending status "
+        "propose_operations and validate_decision_document at the resulting revision. If the account "
+        "requires prescan human approval, request_submission_review creates the exact-revision portal "
+        "review; a URL or pending status "
         "is not approval. After the user completes review, get_submission_approval retrieves the "
         "server-issued receipt. Pass its draft_id and approval_ref with the exact revision and a stable "
         "idempotency_key to submit_conversion; no second bridge confirmation is needed. Refused, "
         "expired, revoked or changed reviews require a new review, never an invented receipt. "
+        "Otherwise call submit_conversion with the exact job_id and revision "
+        "and a stable idempotency_key, following the bridge's confirmation. An idempotency_key alone "
+        "does not require portal review, and listed review tools alone do not require it. "
+        "If the server returns approval_required, obtain its required "
+        "approval receipt; local confirmation cannot override that requirement. "
         "For other supported job types submit with submit_file "
         "(the user may be asked to confirm the upload), then follow the job with wait_for_job, calling it "
         "again while timed_out is true. Report the verdict (ready, needs review or blocked), the reason "
@@ -268,22 +274,41 @@ def upload_request(details: dict, protocol: str) -> dict:
 
 
 def apply_request(details: dict, protocol: str) -> dict:
-    """elicitation/create params before a guided-mapping apply queues a re-conversion (#12)."""
+    """elicitation/create params before a remote tool queues work."""
     count = details.get("answers") or 0
+    title = "Queue the new conversion"
+    description = "Apply these decisions and convert again now"
     if details.get("tool") == "submit_conversion":
         revision = details.get("revision")
         message = (f"Convert prescan {details['job_id']} with decision revision "
                    f"{revision if type(revision) is int else '(as given)'}? NetConverter queues the "
                    "conversion as a new job with the decisions you recorded; your configuration is not "
                    "shown to the assistant.")
+    elif details.get("tool") == "rerun_job":
+        message = (f"Re-run job {details['job_id']} on the current engine? NetConverter queues a new "
+                   "conversion with the same stored source, options and decisions; your configuration "
+                   "is not shown to the assistant. No device deployment occurs.")
+        description = "Re-run this job with its stored source and decisions"
+    elif details.get("tool") in {"start_job", "start_prescan"}:
+        route = str(details["source_vendor"])
+        if details.get("target_vendor"):
+            route += f" → {details['target_vendor']}"
+        job_type = details["job_type"]
+        message = (f"Start {job_type} for uploaded file {details['file_id']} "
+                   f"({details['device_type']}, {route})? NetConverter uses the file already uploaded; "
+                   "its configuration is not shown to the assistant. No device deployment occurs.")
+        if job_type == "prescan":
+            message += " This starts analysis only; conversion is a separate step."
+        title = "Queue the new job"
+        description = f"Start this {job_type} job now"
     else:
         message = (f"Apply {count} mapping answer{'' if count == 1 else 's'} to job {details['job_id']}? "
                    "NetConverter queues a new conversion with these decisions; your configuration is not "
                    "shown to the assistant.")
     params = {"message": message, "requestedSchema": {
         "type": "object",
-        "properties": {"apply": {"type": "boolean", "title": "Queue the new conversion",
-                                 "description": "Apply these decisions and convert again now", "default": False}},
+        "properties": {"apply": {"type": "boolean", "title": title,
+                                 "description": description, "default": False}},
         "required": ["apply"]}}
     if protocol >= "2025-11-25":
         params["mode"] = "form"

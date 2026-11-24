@@ -19,6 +19,36 @@ from tests.test_clerk import form, oauth_server
 from tests.test_mcp import AccountServer, RemoteServer
 
 
+@pytest.mark.parametrize('name', ['start_job', 'start_prescan', 'rerun_job'])
+@pytest.mark.parametrize('replacement', ['new-login', None])
+def test_login_change_during_queue_confirmation_cannot_use_prior_approval(tmp_path, name, replacement):
+    from tests.test_issue_86_mcp_parity import WRITES, payload
+
+    store = Store(tokens('old'))
+    credential = ClerkSession(store)
+    upstream = RemoteServer()
+    upstream.tools = (name,)
+    upstream.require_token = 'synthetic-access-old'
+    remote = RemoteMCP('https://api.example/mcp/v1', credential,
+                       transport=httpx.MockTransport(upstream))
+    bridge = Bridge(tmp_path, 'https://api.example/external/v1', credential,
+                    remote=remote, credential_source='clerk_session', level='full')
+
+    def change_login_and_accept(_):
+        store.save(tokens(replacement) if replacement else None)
+        upstream.require_token = 'synthetic-access-new-login'
+        upstream.tools = ('get_account',)
+        return 'accept'
+
+    bridge.confirm_apply = change_login_and_accept
+    try:
+        result = payload(bridge.call(name, WRITES[name]))
+        assert result['error'] in {'approval_context_changed', 'not_signed_in'}
+        assert not [r for r in upstream.requests if json.loads(r.content).get('method') == 'tools/call']
+    finally:
+        remote.close()
+
+
 class Store:
     def __init__(self, value=None, *, clear_works=True):
         self.value = value
@@ -311,28 +341,36 @@ def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, mo
 
 
 @pytest.mark.parametrize("invalidate_first", [True, False])
-def test_old_confirmation_cannot_authorize_remote_write_after_relogin(tmp_path, invalidate_first):
+@pytest.mark.parametrize("name", ["submit_conversion", "rerun_job", "start_job", "start_prescan"])
+@pytest.mark.parametrize("still_advertised", [True, False])
+def test_old_confirmation_cannot_authorize_remote_write_after_relogin(
+        tmp_path, invalidate_first, name, still_advertised):
+    from tests.test_issue_86_mcp_parity import WRITES
+
     store = Store(tokens('old'))
     credential, _ = failed_session(store)
-    upstream = RemoteServer(require_token='synthetic-access-old', tools=('get_account', 'submit_conversion'))
+    upstream = RemoteServer(require_token='synthetic-access-old', tools=('get_account', name))
     remote = RemoteMCP('https://api.netconverter.ai/mcp/v1/', credential,
                        transport=httpx.MockTransport(upstream))
     bridge = Bridge(tmp_path, 'https://api.netconverter.ai/external/v1', credential, remote,
         transport=httpx.MockTransport(AccountServer()), credential_source='clerk_session')
     bridge.confirm_apply = lambda details: 'client_declined'
-    args = {'job_id': 'psc_0123456789ab', 'revision': 2}
+    args = WRITES.get(name, {'job_id': 'psc_0123456789ab', 'revision': 2})
     try:
-        first = bridge.call('submit_conversion', args)
+        first = bridge.call(name, args)
         pending = json.loads(first['content'][0]['text'])
         assert pending['error'] == 'confirmation_required'
         if invalidate_first:
             assert credential.refresh() is False
         store.save(tokens('new'))
         upstream.require_token = 'synthetic-access-new'
-        second = bridge.call('submit_conversion', {**args, 'confirm_token': pending['confirm_token']})
-        assert json.loads(second['content'][0]['text'])['error'] == 'invalid_confirm_token'
+        if not still_advertised:
+            upstream.tools = ('get_account',)
+        second = bridge.call(name, {**args, 'confirm_token': pending['confirm_token']})
+        assert json.loads(second['content'][0]['text'])['error'] == (
+            'invalid_confirm_token' if still_advertised else 'unknown_tool')
         actual = [json.loads(r.content) for r in upstream.requests]
-        assert not [r for r in actual if r.get('params', {}).get('name') == 'submit_conversion']
+        assert not [r for r in actual if r.get('params', {}).get('name') == name]
     finally:
         remote.close()
 
