@@ -2,8 +2,8 @@
 
 Every change is shown first and applied only after an explicit yes. Reading a
 client's config to see whether it is already connected never modifies it. An
-edited JSON file keeps a ``.bak`` copy of what it replaced; Claude Code's MCP
-entry is changed only through its own ``claude mcp add`` command.
+edited JSON file keeps a ``.bak`` copy of what it replaced. Claude Code's new
+MCP entries use ``claude mcp add``; existing user entries are updated atomically.
 """
 
 from __future__ import annotations
@@ -135,8 +135,14 @@ class ClientSpec:
     installed: Callable[[], bool] = lambda: True
 
 
+def _claude_user_path() -> Path:
+    # Claude relocates .claude.json inside an explicit CLAUDE_CONFIG_DIR.
+    directory = os.getenv("CLAUDE_CONFIG_DIR")
+    return (Path(directory) if directory else Path.home()) / ".claude.json"
+
+
 def _claude_configured() -> bool:
-    data = _read_json(Path.home() / ".claude.json") or {}
+    data = _read_json(_claude_user_path()) or {}
     scopes = [data.get("mcpServers") or {}]
     scopes += [(p or {}).get("mcpServers") or {} for p in (data.get("projects") or {}).values()
                if isinstance(p, dict)]
@@ -190,7 +196,8 @@ def _desktop_configured() -> bool:
 
 
 def _claude_settings_path() -> Path:
-    return Path.home() / ".claude" / "settings.json"
+    directory = os.getenv("CLAUDE_CONFIG_DIR")
+    return (Path(directory) if directory else Path.home() / ".claude") / "settings.json"
 
 
 def read_deny_rule(root: Path) -> str:
@@ -410,7 +417,7 @@ def _vscode_configured(root: Path | None = None) -> bool:
 
 CLIENTS = {
     "claude-code": ClientSpec("Claude Code", _claude_configured,
-                              installed=lambda: bool(shutil.which("claude")) or (Path.home() / ".claude.json").exists()),
+                              installed=lambda: bool(shutil.which("claude")) or _claude_user_path().exists()),
     "claude-desktop": ClientSpec("Claude Desktop", _desktop_configured,
                                  installed=lambda: bool(_desktop_path()) and _desktop_path().parent.exists()),
     "cursor": ClientSpec("Cursor", _cursor_configured, installed=_exists(_cursor_path)),
@@ -467,15 +474,42 @@ def plan(key: str, root: Path) -> Change:
     if key == "claude-code":
         argv = ["claude", "mcp", "add", "--scope", "user", SERVER_NAME, "--", exe, *_args(root)]
         found = shutil.which("claude")
+        path = _claude_user_path()
+        entry = {"type": "stdio", "command": exe, "args": _args(root)}
+        data = _read_json(path)
+        if data is None or not isinstance(data.get("mcpServers", {}), dict):
+            return Change(key, "Claude Code", str(path),
+                          "Claude Code's user config cannot be merged safely; nothing was changed.",
+                          json.dumps({"mcpServers": {SERVER_NAME: entry}}, indent=2),
+                          can_apply=False, manual=f"Repair the JSON object and mcpServers object in {path}, then retry.")
+        replacing = SERVER_NAME in data.get("mcpServers", {})
 
         def run() -> str:
+            current = _read_json(path)  # keep changes made after the preview
+            if current is None or not isinstance(current.get("mcpServers", {}), dict):
+                raise RuntimeError(f"{path} cannot be merged safely; nothing was changed")
+            servers = current.get("mcpServers", {})
+            if SERVER_NAME in servers:
+                # Claude has no replace flag. Never remove first: a failed add
+                # would strand the user's working entry. Only replace our key.
+                replacement = dict(entry)
+                previous = servers[SERVER_NAME]
+                if isinstance(previous, dict) and isinstance(previous.get("env"), dict):
+                    replacement["env"] = previous["env"]
+                if previous != replacement:
+                    servers[SERVER_NAME] = replacement
+                    _write_json(path, current)
+                return "Claude Code: restart it or run /mcp to see the netconverter tools."
             done = subprocess.run([found, *argv[1:]], capture_output=True, text=True, timeout=60)
             if done.returncode != 0:
                 raise RuntimeError((done.stderr or done.stdout or "claude mcp add failed").strip()[:300])
             return "Claude Code: restart it or run /mcp to see the netconverter tools."
         return Change(key, "Claude Code", "Claude Code (user scope)",
-                      f"Adds the '{SERVER_NAME}' MCP server for this folder.",
-                      " ".join(argv), can_apply=bool(found),
+                      (f"Updates mcpServers.{SERVER_NAME} in {path}, keeping its environment and all "
+                       "other servers and settings (backup: .bak)." if replacing else
+                       f"Adds the '{SERVER_NAME}' MCP server for this folder."),
+                      (json.dumps({"mcpServers": {SERVER_NAME: entry}}, indent=2) if replacing else
+                       " ".join(argv)), can_apply=bool(found),
                       manual="Claude Code is not on PATH. Run the command above in a terminal where it is.",
                       apply=run, followups=[plan_claude_read_deny(root)])
     if key == "claude-desktop":

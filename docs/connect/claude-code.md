@@ -19,8 +19,13 @@ cd ~/migrations
 netconverter connect claude-code
 ```
 
-This runs `claude mcp add --scope user netconverter -- netconverter mcp --workspace <folder>`
-for you, after showing it. It then offers a second change (Enter accepts): a
+For a new connection, this runs
+`claude mcp add --scope user netconverter -- netconverter mcp --workspace <folder>`
+after showing it. If the user entry already exists, it updates the command and
+workspace atomically, preserving its environment, other servers and settings,
+and keeping the previous config in `.claude.json.bak`. The MCP update preview
+omits existing configuration values. An explicit `CLAUDE_CONFIG_DIR` is respected.
+It then offers a second change (Enter accepts): a
 `Read(//<folder>/**)` deny rule in `~/.claude/settings.json`, so Claude Code hands
 configurations to the bridge by path instead of reading their text itself.
 
