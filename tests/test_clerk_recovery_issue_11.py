@@ -311,28 +311,36 @@ def test_relogin_invalidates_remote_session_view_and_bridge_profile(tmp_path, mo
 
 
 @pytest.mark.parametrize("invalidate_first", [True, False])
-def test_old_confirmation_cannot_authorize_remote_write_after_relogin(tmp_path, invalidate_first):
+@pytest.mark.parametrize("name", ["submit_conversion", "rerun_job", "start_job", "start_prescan"])
+@pytest.mark.parametrize("still_advertised", [True, False])
+def test_old_confirmation_cannot_authorize_remote_write_after_relogin(
+        tmp_path, invalidate_first, name, still_advertised):
+    from tests.test_issue_86_mcp_parity import WRITES
+
     store = Store(tokens('old'))
     credential, _ = failed_session(store)
-    upstream = RemoteServer(require_token='synthetic-access-old', tools=('get_account', 'submit_conversion'))
+    upstream = RemoteServer(require_token='synthetic-access-old', tools=('get_account', name))
     remote = RemoteMCP('https://api.netconverter.ai/mcp/v1/', credential,
                        transport=httpx.MockTransport(upstream))
     bridge = Bridge(tmp_path, 'https://api.netconverter.ai/external/v1', credential, remote,
         transport=httpx.MockTransport(AccountServer()), credential_source='clerk_session')
     bridge.confirm_apply = lambda details: 'client_declined'
-    args = {'job_id': 'psc_0123456789ab', 'revision': 2}
+    args = WRITES.get(name, {'job_id': 'psc_0123456789ab', 'revision': 2})
     try:
-        first = bridge.call('submit_conversion', args)
+        first = bridge.call(name, args)
         pending = json.loads(first['content'][0]['text'])
         assert pending['error'] == 'confirmation_required'
         if invalidate_first:
             assert credential.refresh() is False
         store.save(tokens('new'))
         upstream.require_token = 'synthetic-access-new'
-        second = bridge.call('submit_conversion', {**args, 'confirm_token': pending['confirm_token']})
-        assert json.loads(second['content'][0]['text'])['error'] == 'invalid_confirm_token'
+        if not still_advertised:
+            upstream.tools = ('get_account',)
+        second = bridge.call(name, {**args, 'confirm_token': pending['confirm_token']})
+        assert json.loads(second['content'][0]['text'])['error'] == (
+            'invalid_confirm_token' if still_advertised else 'unknown_tool')
         actual = [json.loads(r.content) for r in upstream.requests]
-        assert not [r for r in actual if r.get('params', {}).get('name') == 'submit_conversion']
+        assert not [r for r in actual if r.get('params', {}).get('name') == name]
     finally:
         remote.close()
 

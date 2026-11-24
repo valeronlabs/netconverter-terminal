@@ -274,22 +274,41 @@ def upload_request(details: dict, protocol: str) -> dict:
 
 
 def apply_request(details: dict, protocol: str) -> dict:
-    """elicitation/create params before a guided-mapping apply queues a re-conversion (#12)."""
+    """elicitation/create params before a remote tool queues work."""
     count = details.get("answers") or 0
+    title = "Queue the new conversion"
+    description = "Apply these decisions and convert again now"
     if details.get("tool") == "submit_conversion":
         revision = details.get("revision")
         message = (f"Convert prescan {details['job_id']} with decision revision "
                    f"{revision if type(revision) is int else '(as given)'}? NetConverter queues the "
                    "conversion as a new job with the decisions you recorded; your configuration is not "
                    "shown to the assistant.")
+    elif details.get("tool") == "rerun_job":
+        message = (f"Re-run job {details['job_id']} on the current engine? NetConverter queues a new "
+                   "conversion with the same stored source, options and decisions; your configuration "
+                   "is not shown to the assistant. No device deployment occurs.")
+        description = "Re-run this job with its stored source and decisions"
+    elif details.get("tool") in {"start_job", "start_prescan"}:
+        route = str(details["source_vendor"])
+        if details.get("target_vendor"):
+            route += f" → {details['target_vendor']}"
+        job_type = details["job_type"]
+        message = (f"Start {job_type} for uploaded file {details['file_id']} "
+                   f"({details['device_type']}, {route})? NetConverter uses the file already uploaded; "
+                   "its configuration is not shown to the assistant. No device deployment occurs.")
+        if job_type == "prescan":
+            message += " This starts analysis only; conversion is a separate step."
+        title = "Queue the new job"
+        description = f"Start this {job_type} job now"
     else:
         message = (f"Apply {count} mapping answer{'' if count == 1 else 's'} to job {details['job_id']}? "
                    "NetConverter queues a new conversion with these decisions; your configuration is not "
                    "shown to the assistant.")
     params = {"message": message, "requestedSchema": {
         "type": "object",
-        "properties": {"apply": {"type": "boolean", "title": "Queue the new conversion",
-                                 "description": "Apply these decisions and convert again now", "default": False}},
+        "properties": {"apply": {"type": "boolean", "title": title,
+                                 "description": description, "default": False}},
         "required": ["apply"]}}
     if protocol >= "2025-11-25":
         params["mode"] = "form"

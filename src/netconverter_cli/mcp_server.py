@@ -106,6 +106,8 @@ REMOTE_TOOLS_DEFAULT = frozenset({
     "get_object_dependencies", "get_object_summary", "get_report", "get_route_summary",
     "get_target_config", "get_translation_edge_summary", "get_unused_objects",
     "get_vpn_summary", "get_zone_summary", "kb_explain", "kb_search", "list_jobs",
+    "get_mop", "list_artifacts", "diff_runs", "prove_flows", "explain_rule", "list_source_files",
+    "rerun_job", "start_job", "start_prescan",
     "list_objects_with_attribute", "list_rules_matching", "query_ir", "search",
     "select_job", "simulate_flow", "vendor_capability_lookup",
     # Ranked readiness holds from the stored evidence (aws#1494); scrubbed like get_evidence.
@@ -125,7 +127,7 @@ MAPPING_TOOLS = frozenset({"get_mapping_questions", "validate_mapping", "apply_m
 REMOTE_TOOLS_STRICT = frozenset({
     "list_jobs", "select_job", "get_account", "search", "fetch", "kb_search", "kb_explain",
     "vendor_capability_lookup", "get_job_brief", "get_evidence", "get_report", "get_diagram",
-    "why_needs_review",
+    "why_needs_review", "get_mop", "list_artifacts", "diff_runs",
 }) | MAPPING_TOOLS
 assert REMOTE_TOOLS_STRICT <= REMOTE_TOOLS_DEFAULT
 # Remote tools added after servers already in the field: an allowlisted name the server
@@ -142,8 +144,9 @@ GUIDED_TOOLS = GUIDED_READ_TOOLS + GUIDED_WRITE_TOOLS
 # ``submit_*`` stays blocked (a remote submit would take configuration text through the
 # model); submit_conversion takes only a prescan id and a revision.
 SUBMIT_ALLOWED = frozenset({"submit_conversion"})
-# Remote calls that queue a conversion: confirmed with the user first, like an upload.
-CONFIRM_REMOTE = frozenset({"apply_mapping_answers", "submit_conversion"})
+# Remote calls that queue work: confirmed with the user first, like an upload.
+CONFIRM_REMOTE = frozenset({"apply_mapping_answers", "submit_conversion",
+                            "rerun_job", "start_job", "start_prescan"})
 PRESCAN_NEXT_STEPS = (
     "The job stops at the prescan; nothing is converted yet. When wait_for_job reports it "
     "completed, call list_operations, get_decision_document and validate_decision_document "
@@ -594,8 +597,7 @@ class Bridge:
         # Set by the stdio server while submit_file runs for a client with form elicitation (#20):
         # called with the upload's path/size/hash, returns accept/decline/cancel, or None to proceed.
         self.confirm_upload = None
-        # The same for apply_mapping_answers (#12) and submit_conversion: asked before a
-        # conversion is queued.
+        # The same for CONFIRM_REMOTE: asked before remote work is queued.
         self.confirm_apply = None
         # False (--no-upload-confirm, NETCONVERTER_MCP_UPLOAD_CONFIRM=0): never send a form;
         # the AI client's own tool approval is the confirmation (#37).
@@ -1414,6 +1416,11 @@ class Bridge:
                 properties = schema.setdefault("properties", {})
                 if isinstance(properties, dict):
                     properties.setdefault("confirm_token", CONFIRM_TOKEN_SCHEMA)
+                    if name == "rerun_job":
+                        # Approval must name a job, not a mutable session selection.
+                        required = schema.setdefault("required", [])
+                        if "job_id" not in required:
+                            required.append("job_id")
                     tool["inputSchema"] = schema
             tools.append(tool)
         self._prescan_receipts = receipt_schema and {
@@ -1495,6 +1502,10 @@ class Bridge:
         if remote_name in CONFIRM_REMOTE and not receipt_submission:
             arguments = dict(arguments)
             token = arguments.pop("confirm_token", None)
+            if remote_name == "rerun_job" and (
+                    not isinstance(arguments.get("job_id"), str)
+                    or not _JOB_ID.fullmatch(arguments["job_id"])):
+                return _error_result("invalid_arguments", "Provide an explicit job_id to confirm the exact job to re-run")
             answers = arguments.get("answers")
             details = {"job_id": str(arguments.get("job_id") or "the selected job"),
                        "answers": len(answers) if isinstance(answers, list) else 0}
@@ -1503,6 +1514,19 @@ class Bridge:
             what = (f"queue a conversion of {details['job_id']} at decision revision {details['revision']}"
                     if remote_name == "submit_conversion" else
                     f"apply {details['answers']} mapping answer(s) to {details['job_id']} and convert again")
+            if remote_name == "rerun_job":
+                details.update(tool=remote_name)
+                what = f"re-run {details['job_id']} on the current engine with its stored source and decisions"
+            elif remote_name in {"start_job", "start_prescan"}:
+                details = {key: arguments.get(key) for key in
+                           ("file_id", "source_vendor", "target_vendor", "device_type")}
+                details.update(tool=remote_name, job_type=("prescan" if remote_name == "start_prescan"
+                                                          else arguments.get("job_type")))
+                route = str(details["source_vendor"])
+                if details["target_vendor"]:
+                    route += f" → {details['target_vendor']}"
+                what = (f"start {details['job_type']} for uploaded file {details['file_id']} "
+                        f"({details['device_type']}, {route})")
             try:
                 self._confirm(self.confirm_apply, details,
                               (remote_name, json.dumps(arguments, sort_keys=True, default=str)), token,

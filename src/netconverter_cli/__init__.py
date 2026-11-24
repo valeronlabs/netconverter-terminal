@@ -1,3 +1,3 @@
 """NetConverter CLI: file transfer and conversation are separate paths."""
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"

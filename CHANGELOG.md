@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.3 — private candidate
+
+- Restore Terminal MCP access to the hosted MOP, artifact list, run diff, flow proof,
+  rule explanation and uploaded-source list when the authenticated server offers them
+  (#80, #86). MOP, artifact lists and run diffs also follow the server's strict view;
+  flow proofs, rule explanations and uploaded-source names require full exposure.
+- Confirm `start_job`, `start_prescan` and `rerun_job` with the existing queue approval
+  flow, preserving exact-argument single-use tokens and server idempotency keys. These
+  tools require full exposure and server advertisement. A rerun requires an explicit
+  job ID so approval cannot follow a changed session selection. Server admission and
+  prescan approval requirements remain authoritative.
+- Includes the private 0.8.2 Claude Code reconnect correction (#84). Public publication
+  and installed-client qualification remain separate from this private candidate.
+
 ## 0.8.1 — 2026-11-23
 
 - Accept `cisco_nxos_switch` as a conversion target, so the Juniper switch → Cisco NX-OS preview paths (`juniper_junos_switch` and `juniper_set_switch`) the server lists in `netconverter capabilities` submit from the CLI and the local MCP bridge instead of being refused before upload (#78). NX-OS is a target only: it is refused as a source before any file is read or sent, and `--vendor` names the valid source codes when given a target-only code. Ambiguous codes without a router or switch identity stay refused; upload confirmation and workspace confinement are unchanged. The path is a server preview; this release adds no platform qualification.
