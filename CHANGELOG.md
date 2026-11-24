@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.3 — private candidate
+## 0.8.3 — 2026-11-24
 
 - Restore Terminal MCP access to the hosted MOP, artifact list, run diff, flow proof,
   rule explanation and uploaded-source list when the authenticated server offers them
@@ -13,8 +13,16 @@
   accidentally duplicate an ambiguous retry. Sign-in or workspace privacy changes
   while a confirmation is open cancel that approval. Server admission and prescan
   approval requirements remain authoritative.
-- Includes the private 0.8.2 Claude Code reconnect correction (#84). Public publication
-  and installed-client qualification remain separate from this private candidate.
+- Send an ordinary `submit_conversion` retry key down the confirmed submission path
+  instead of mistaking it for a portal approval receipt (#82). A draft ID or approval
+  reference still requires a complete receipt, and a server approval requirement
+  remains authoritative.
+- `netconverter connect claude-code` updates an existing user-scoped entry in place,
+  keeps unrelated servers and settings, and leaves a backup of the previous file (#84).
+- Qualification: installed macOS bridge workflows were exercised against the live
+  service; on Windows 11 the installed bridge start, sign-in and tool catalog were
+  checked. Native Windows end-to-end and each assistant's own workflow keep their
+  separate acceptance scopes.
 
 ## 0.8.1 — 2026-11-23
 
